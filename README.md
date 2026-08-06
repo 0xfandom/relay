@@ -54,9 +54,39 @@ crates/
 Requires a recent stable Rust toolchain.
 
 ```bash
-cargo test
-cargo test -p relay-domain
+docker compose up -d       # Postgres on 5433
+cargo test                 # unit tests plus end-to-end against a real database
 ```
+
+## Running locally
+
+Three processes: the ingest API, the dispatcher, and a configurable receiver
+standing in for a customer endpoint.
+
+```bash
+export DATABASE_URL=postgres://relay:relay@localhost:5433/relay
+
+RELAY_TESTKIT_SECRET=whsec_demo cargo run -p relay-testkit   # :9090
+cargo run -p relay-api                                       # :8080
+cargo run -p relay-dispatcher
+```
+
+Register an endpoint and send it an event:
+
+```bash
+curl -X POST 127.0.0.1:8080/v1/endpoints \
+  -H 'content-type: application/json' \
+  -d '{"url":"http://127.0.0.1:9090/verify","event_types":["order.paid"]}'
+
+curl -X POST 127.0.0.1:8080/v1/events \
+  -H 'content-type: application/json' \
+  -d '{"type":"order.paid","amount":4999}'
+# 202 Accepted, with the event id and one delivery id per subscribed endpoint
+```
+
+The receiver exposes failure modes for testing delivery behaviour:
+`/always500`, `/slow?ms=`, `/flaky?pct=`, `/429?retry_after=`, and `/verify`,
+which checks the signature and the freshness window.
 
 ## Signature format
 
