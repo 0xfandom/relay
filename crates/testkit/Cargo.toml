@@ -1,0 +1,10 @@
+[package]
+name = "relay-testkit"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+axum = "0.8.9"
+relay-domain = { version = "0.1.0", path = "../domain" }
+serde = { version = "1.0.229", features = ["derive"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "time"] }
