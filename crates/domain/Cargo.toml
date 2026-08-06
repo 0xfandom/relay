@@ -1,0 +1,13 @@
+[package]
+name = "relay-domain"
+edition.workspace = true
+version.workspace = true
+
+# Deliberately empty. Step 1 is yours:
+#   cargo add hmac sha2 hex subtle
+# Then read WHY each one is here in BRIEF/M1.md.
+[dependencies]
+hex = "0.4.3"
+hmac = "0.13.0"
+sha2 = "0.11.0"
+subtle = "2.6.1"
