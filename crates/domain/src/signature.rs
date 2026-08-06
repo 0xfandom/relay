@@ -20,12 +20,22 @@
 //! (Both answers are in the PRD, §Signatures. The tests below will fail loudly
 //! if you get #2 wrong.)
 
+use hmac::{Hmac, KeyInit, Mac};
+use sha2::Sha256;
+
+type HmacSha256 = Hmac<Sha256>;
+
 /// Build the byte string that gets signed: `<timestamp>.<body>`.
 ///
 /// Returns bytes, not a `String`, because a webhook body is arbitrary bytes and
 /// need not be valid UTF-8.
 pub fn signed_payload(timestamp: i64, body: &[u8]) -> Vec<u8> {
-    todo!("build `<timestamp>.<body>` as a Vec<u8>")
+    let ts = timestamp.to_string();
+    let mut out = Vec::with_capacity(ts.len() + 1 + body.len());
+    out.extend_from_slice(ts.as_bytes());
+    out.push(b'.');
+    out.extend_from_slice(body);
+    out
 }
 
 /// HMAC-SHA256 over [`signed_payload`], hex-encoded lowercase.
@@ -33,7 +43,9 @@ pub fn signed_payload(timestamp: i64, body: &[u8]) -> Vec<u8> {
 /// `secret` is bytes rather than `&str` because HMAC keys are byte strings and
 /// accept any length.
 pub fn sign(secret: &[u8], timestamp: i64, body: &[u8]) -> String {
-    todo!("HMAC-SHA256 the signed payload with `secret`, return lowercase hex")
+    let mut mac = new_mac(secret);
+    mac.update(&signed_payload(timestamp, body));
+    hex::encode(mac.finalize().into_bytes())
 }
 
 /// Recompute the signature and compare it to `candidate_hex`.
@@ -45,7 +57,24 @@ pub fn sign(secret: &[u8], timestamp: i64, body: &[u8]) -> String {
 /// This is the receiver's job in production — we implement it so `testkit` can
 /// verify us, and so the property is tested from both sides.
 pub fn verify(secret: &[u8], timestamp: i64, body: &[u8], candidate_hex: &str) -> bool {
-    todo!("recompute and compare in constant time")
+    // A candidate that is not valid hex is simply wrong — decoding must not panic,
+    // or one malformed header takes the process down.
+    let Ok(candidate) = hex::decode(candidate_hex) else {
+        return false;
+    };
+
+    let mut mac = new_mac(secret);
+    mac.update(&signed_payload(timestamp, body));
+
+    // `verify_slice` compares in constant time. Doing this by hand with `==` on the
+    // hex strings would short-circuit at the first differing byte, leaking how much
+    // of the signature was correct through response timing.
+    mac.verify_slice(&candidate).is_ok()
+}
+
+/// HMAC accepts a key of any length, so `new_from_slice` cannot fail here.
+fn new_mac(secret: &[u8]) -> HmacSha256 {
+    HmacSha256::new_from_slice(secret).expect("HMAC accepts keys of any length")
 }
 
 #[cfg(test)]
