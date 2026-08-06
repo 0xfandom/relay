@@ -1,0 +1,21 @@
+[package]
+name = "relay-dispatcher"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+relay-domain = { version = "0.1.0", path = "../domain" }
+relay-store = { version = "0.1.0", path = "../store" }
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "charset"] }
+thiserror = "2.0.19"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+uuid = "1.24.0"
+
+[dev-dependencies]
+axum = "0.8.9"
+relay-api = { path = "../api" }
+relay-testkit = { path = "../testkit" }
+serde_json = "1.0.151"
