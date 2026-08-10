@@ -34,18 +34,10 @@ pub fn router(state: AppState) -> Router {
 }
 
 async fn healthz(State(state): State<AppState>) -> Response {
-    match sqlx_ping(&state.store).await {
+    match state.store.ping().await {
         Ok(()) => (StatusCode::OK, "ok").into_response(),
-        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
+        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
     }
-}
-
-async fn sqlx_ping(store: &Store) -> Result<(), String> {
-    sqlx::query("SELECT 1")
-        .execute(store.pool())
-        .await
-        .map(|_| ())
-        .map_err(|e| e.to_string())
 }
 
 // ------------------------------------------------------------------ endpoints
