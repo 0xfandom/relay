@@ -48,7 +48,6 @@ struct Fixture {
     api: SocketAddr,
     receiver: Receiver,
     event_type: String,
-    endpoint_secret: String,
 }
 
 /// Wire up an isolated API + receiver + endpoint.
@@ -78,7 +77,6 @@ async fn fixture(path: &str, endpoint_secret: &str, receiver_secret: &str) -> Fi
         api,
         receiver,
         event_type,
-        endpoint_secret: endpoint_secret.to_string(),
     }
 }
 
@@ -183,8 +181,7 @@ async fn payload_bytes_are_stored_and_sent_verbatim() {
 async fn a_tampered_body_fails_verification() {
     // Sign one body, deliver a different one. Simulates modification in transit.
     let secret = "whsec_tamper";
-    let f = fixture("/verify", secret, secret).await;
-    let _ = &f.endpoint_secret;
+    let _f = fixture("/verify", secret, secret).await;
 
     let original = r#"{"amount":10}"#;
     let timestamp = 1_700_000_000_i64;
@@ -244,4 +241,31 @@ async fn ingest_returns_immediately_even_when_the_endpoint_hangs() {
         elapsed.as_millis() < 1000,
         "ingest took {elapsed:?}; it must never wait on a customer endpoint"
     );
+}
+
+#[tokio::test]
+async fn a_delivery_is_never_sent_twice_by_the_same_loop() {
+    // Regression test for a real defect: the sender used to claim nothing before
+    // sending, so any failure to persist the outcome left the row `pending`, the
+    // loop picked it up again, and the endpoint received the same webhook
+    // repeatedly for as long as the write kept failing.
+    //
+    // Claiming first makes the second pass find nothing to do.
+    let f = fixture("/verify", "whsec_once", "whsec_once").await;
+    let deliveries = ingest(f.api, &f.event_type, r#"{"type":"order.paid"}"#).await;
+    let sender = Sender::new(f.store.clone());
+
+    let first = sender.deliver_by_id(deliveries[0]).await.unwrap();
+    assert_eq!(first, Some(Outcome::Succeeded { status: 200 }));
+
+    // Same delivery, second pass: already claimed and finished, so nothing happens.
+    let second = sender.deliver_by_id(deliveries[0]).await.unwrap();
+    assert_eq!(second, None, "a finished delivery must not be sent again");
+
+    assert_eq!(
+        f.receiver.hits(),
+        1,
+        "the endpoint must be contacted exactly once"
+    );
+    assert_eq!(f.store.attempts_for(deliveries[0]).await.unwrap(), 1);
 }

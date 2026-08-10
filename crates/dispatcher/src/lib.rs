@@ -11,7 +11,7 @@
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use relay_store::{PendingDelivery, Store};
+use relay_store::{DeliveryStatus, PendingDelivery, Store};
 use uuid::Uuid;
 
 /// Customer error pages can be enormous. Store enough to debug with, no more.
@@ -38,6 +38,9 @@ pub enum Outcome {
 pub struct Sender {
     store: Store,
     client: reqwest::Client,
+    /// Identifies which process holds a claim. Only informational today; M2's
+    /// reaper uses it to attribute stranded work.
+    worker_id: String,
 }
 
 impl Sender {
@@ -51,7 +54,11 @@ impl Sender {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("reqwest client builds with static configuration");
-        Self { store, client }
+        Self {
+            store,
+            client,
+            worker_id: format!("sender-{}", uuid::Uuid::new_v4()),
+        }
     }
 
     /// Take the next due delivery, if any, and attempt it.
@@ -59,7 +66,7 @@ impl Sender {
         let Some(pending) = self.store.next_pending_delivery().await? else {
             return Ok(None);
         };
-        Ok(Some(self.deliver(pending).await?))
+        self.deliver(pending).await
     }
 
     /// Attempt one named delivery.
@@ -67,10 +74,20 @@ impl Sender {
         let Some(pending) = self.store.pending_delivery_by_id(delivery_id).await? else {
             return Ok(None);
         };
-        Ok(Some(self.deliver(pending).await?))
+        self.deliver(pending).await
     }
 
-    async fn deliver(&self, p: PendingDelivery) -> Result<Outcome, SendError> {
+    async fn deliver(&self, p: PendingDelivery) -> Result<Option<Outcome>, SendError> {
+        // Claim before sending, not after.
+        //
+        // Otherwise a failure to persist the result leaves the row `pending`, the
+        // loop picks it up on the next pass, and the same webhook is sent again —
+        // and again, for as long as the write keeps failing. The endpoint sees an
+        // unbounded flood and nothing here reports a problem.
+        if !self.store.claim(p.delivery_id, &self.worker_id).await? {
+            return Ok(None);
+        }
+
         let timestamp = unix_now();
 
         // Sign the stored bytes, and send those same bytes. Nothing in between may
@@ -135,17 +152,20 @@ impl Sender {
             ),
         };
 
-        let outcome_class = match &outcome {
-            Outcome::Succeeded { .. } => "success",
-            Outcome::Failed { .. } => "failed",
+        let (outcome_class, final_status) = match &outcome {
+            Outcome::Succeeded { .. } => ("success", DeliveryStatus::Succeeded),
+            // No retry policy yet, so every failure is terminal. M3 changes this.
+            Outcome::Failed { .. } => ("failed", DeliveryStatus::Dead),
         };
 
-        // The attempt row is written before the status change, so a crash between
-        // the two leaves evidence rather than a silent gap.
+        // Attempt row and final status commit together: an attempt without a status
+        // describes a delivery that looks unfinished but has already been sent, and
+        // a status without an attempt claims an outcome with no evidence for it.
         self.store
-            .record_attempt(
+            .finish_attempt(
                 p.delivery_id,
                 p.attempt,
+                final_status,
                 http_status,
                 latency_ms,
                 outcome_class,
@@ -154,13 +174,7 @@ impl Sender {
             )
             .await?;
 
-        match &outcome {
-            Outcome::Succeeded { .. } => self.store.mark_succeeded(p.delivery_id).await?,
-            // No retry policy yet, so every failure is terminal. M3 changes this.
-            Outcome::Failed { .. } => self.store.mark_dead(p.delivery_id).await?,
-        }
-
-        Ok(outcome)
+        Ok(Some(outcome))
     }
 }
 
