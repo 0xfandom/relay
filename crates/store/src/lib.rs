@@ -56,6 +56,39 @@ impl Store {
         &self.pool
     }
 
+    /// Cheapest possible round trip, for readiness checks.
+    pub async fn ping(&self) -> Result<()> {
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Take ownership of a delivery before sending it.
+    ///
+    /// This is what stops the send loop from re-sending the same delivery when a
+    /// later write fails: once the row is `inflight` it is no longer `pending`, so
+    /// the loop will not pick it up again on the next pass.
+    ///
+    /// The trade is that a crash now strands the row in `inflight` until something
+    /// releases it. A stranded delivery is strictly better than an endpoint being
+    /// hammered with duplicates, and the reaper that releases expired claims
+    /// arrives in M2 alongside the lease.
+    ///
+    /// Returns false if the row was not claimable, which today means another pass
+    /// already took it.
+    pub async fn claim(&self, delivery_id: Uuid, worker: &str) -> Result<bool> {
+        let claimed = sqlx::query(
+            "UPDATE deliveries
+             SET status = 'inflight', locked_at = now(), locked_by = $2
+             WHERE id = $1 AND status = 'pending'",
+        )
+        .bind(delivery_id)
+        .bind(worker)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(claimed == 1)
+    }
+
     // ---------------------------------------------------------------- endpoints
 
     pub async fn create_endpoint(
@@ -183,32 +216,6 @@ impl Store {
         Ok(row)
     }
 
-    pub async fn mark_succeeded(&self, delivery_id: Uuid) -> Result<()> {
-        sqlx::query(
-            "UPDATE deliveries
-             SET status = 'succeeded', attempt = attempt + 1, locked_at = NULL, locked_by = NULL
-             WHERE id = $1",
-        )
-        .bind(delivery_id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// M1 has no retry policy yet, so any failure is terminal. M3 replaces this
-    /// with a classifier and a backoff schedule.
-    pub async fn mark_dead(&self, delivery_id: Uuid) -> Result<()> {
-        sqlx::query(
-            "UPDATE deliveries
-             SET status = 'dead', attempt = attempt + 1, locked_at = NULL, locked_by = NULL
-             WHERE id = $1",
-        )
-        .bind(delivery_id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
     pub async fn get_delivery(&self, id: Uuid) -> Result<Option<Delivery>> {
         let d = sqlx::query_as::<_, Delivery>(
             "SELECT id, event_id, endpoint_id, status, attempt FROM deliveries WHERE id = $1",
@@ -221,19 +228,29 @@ impl Store {
 
     // ------------------------------------------------------------------ attempts
 
-    /// Append one attempt row. Never updated afterwards — this table is the audit
-    /// ledger, and rewriting history would defeat its purpose.
+    /// Append the attempt row and move the delivery to its final state, together.
+    ///
+    /// One transaction, because these two writes describe the same fact. Landing
+    /// the attempt without the status change would leave a delivery that looks
+    /// unfinished but has already been sent; landing the status change without the
+    /// attempt would claim an outcome with no evidence for it.
+    ///
+    /// The attempt row is inserted first so that, within the transaction, the
+    /// evidence precedes the conclusion.
     #[allow(clippy::too_many_arguments)]
-    pub async fn record_attempt(
+    pub async fn finish_attempt(
         &self,
         delivery_id: Uuid,
         attempt_no: i32,
+        final_status: DeliveryStatus,
         http_status: Option<i32>,
         latency_ms: i32,
         outcome_class: &str,
         error: Option<&str>,
         response_snippet: Option<&str>,
     ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+
         sqlx::query(
             "INSERT INTO delivery_attempts
                  (delivery_id, attempt_no, http_status, latency_ms, outcome_class, error, response_snippet)
@@ -246,8 +263,20 @@ impl Store {
         .bind(outcome_class)
         .bind(error)
         .bind(response_snippet)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+
+        sqlx::query(
+            "UPDATE deliveries
+             SET status = $2, attempt = attempt + 1, locked_at = NULL, locked_by = NULL
+             WHERE id = $1",
+        )
+        .bind(delivery_id)
+        .bind(final_status.as_str())
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
         Ok(())
     }
 
@@ -265,4 +294,23 @@ impl Store {
 pub struct Accepted {
     pub event_id: Uuid,
     pub delivery_ids: Vec<Uuid>,
+}
+
+/// The states a delivery can finish an attempt in.
+///
+/// A typed value rather than a bare string, so a typo is a compile error instead
+/// of a row that silently violates the table's CHECK constraint at runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryStatus {
+    Succeeded,
+    Dead,
+}
+
+impl DeliveryStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Dead => "dead",
+        }
+    }
 }
