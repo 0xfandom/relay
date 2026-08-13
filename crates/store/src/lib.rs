@@ -372,7 +372,7 @@ impl Store {
         &self,
         delivery_id: Uuid,
         attempt_no: i32,
-        final_status: DeliveryStatus,
+        result: AttemptResult,
         http_status: Option<i32>,
         latency_ms: i32,
         outcome_class: &str,
@@ -396,13 +396,24 @@ impl Store {
         .execute(&mut *tx)
         .await?;
 
+        // `next_attempt_at` moves only on a retry. On a terminal outcome the row is
+        // no longer `pending`, so the claim query ignores the column entirely and
+        // leaving it alone keeps the last scheduled time visible for debugging.
         sqlx::query(
             "UPDATE deliveries
-             SET status = $2, attempt = attempt + 1, locked_at = NULL, locked_by = NULL
+             SET status = $2,
+                 attempt = attempt + 1,
+                 locked_at = NULL,
+                 locked_by = NULL,
+                 next_attempt_at = CASE
+                     WHEN $3::double precision IS NULL THEN next_attempt_at
+                     ELSE now() + make_interval(secs => $3)
+                 END
              WHERE id = $1",
         )
         .bind(delivery_id)
-        .bind(final_status.as_str())
+        .bind(result.status().as_str())
+        .bind(result.retry_delay().map(|d| d.as_secs_f64()))
         .execute(&mut *tx)
         .await?;
 
@@ -432,6 +443,7 @@ pub struct Accepted {
 /// of a row that silently violates the table's CHECK constraint at runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryStatus {
+    Pending,
     Succeeded,
     Dead,
 }
@@ -439,8 +451,43 @@ pub enum DeliveryStatus {
 impl DeliveryStatus {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Pending => "pending",
             Self::Succeeded => "succeeded",
             Self::Dead => "dead",
+        }
+    }
+}
+
+/// How an attempt ended, and what happens to the delivery next.
+///
+/// One value rather than a status plus an optional delay, because the two are not
+/// independent: a retry without a delay would be claimed again immediately, and a
+/// terminal outcome with one describes a schedule for a delivery that is finished.
+/// Pairing them makes the invalid combinations unrepresentable.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AttemptResult {
+    Succeeded,
+    /// Back to `pending`, claimable again once the delay has passed.
+    Retry {
+        delay: Duration,
+    },
+    /// Permanently failed, or out of attempts.
+    Dead,
+}
+
+impl AttemptResult {
+    pub fn status(self) -> DeliveryStatus {
+        match self {
+            Self::Succeeded => DeliveryStatus::Succeeded,
+            Self::Retry { .. } => DeliveryStatus::Pending,
+            Self::Dead => DeliveryStatus::Dead,
+        }
+    }
+
+    pub fn retry_delay(self) -> Option<Duration> {
+        match self {
+            Self::Retry { delay } => Some(delay),
+            _ => None,
         }
     }
 }
