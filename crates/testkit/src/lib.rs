@@ -116,6 +116,7 @@ impl Receiver {
             .route("/slow", post(slow))
             .route("/flaky", post(flaky))
             .route("/429", post(too_many))
+            .route("/bigbody", post(big_body))
             .route("/received", get(received))
             .with_state(self.clone())
     }
@@ -268,6 +269,31 @@ async fn too_many(
         "slow down",
     )
         .into_response()
+}
+
+#[derive(Deserialize)]
+pub struct BigBodyParams {
+    #[serde(default = "default_kb")]
+    pub kb: usize,
+}
+fn default_kb() -> usize {
+    1024
+}
+
+/// Answers with a deliberately enormous error page.
+///
+/// Real ones are: a stack trace, a framework debug page, an HTML error template with
+/// the whole request echoed back. The sender has to survive them without storing or
+/// buffering the lot.
+async fn big_body(
+    State(state): State<Receiver>,
+    Query(p): Query<BigBodyParams>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let _in_flight = record(&state, &headers, &body);
+    let page = "x".repeat(p.kb * 1024);
+    (StatusCode::INTERNAL_SERVER_ERROR, page).into_response()
 }
 
 async fn received(State(state): State<Receiver>) -> Response {
