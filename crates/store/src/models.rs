@@ -26,6 +26,9 @@ pub struct Delivery {
     pub endpoint_id: Uuid,
     pub status: String,
     pub attempt: i32,
+    /// Set only while `status` is `dead`, and always set then.
+    pub dead_reason: Option<String>,
+    pub generation: i32,
 }
 
 /// A parked delivery, joined with enough context to triage it.
