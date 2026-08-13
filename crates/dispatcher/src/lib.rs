@@ -7,11 +7,11 @@
 //! [`Reaper`] is the third piece and runs alongside them: workers die holding work,
 //! and something has to notice.
 //!
-//! Still absent: retries, backoff, breakers, rate limits. Every failure here is
-//! terminal, which is wrong and is M3's job to fix. Building the boring version
-//! first is not laziness — once retries exist, a bug in signing looks exactly like
-//! a bug in retrying, and telling them apart depends on the single-shot path
-//! already being boringly reliable.
+//! A failed attempt is now reschedulable rather than fatal: the classifier decides
+//! whether another try could plausibly work, and the backoff decides when.
+//!
+//! Still absent: breakers and rate limits, which are about refusing to send at all
+//! rather than about when to send again.
 
 use std::{
     sync::{
@@ -21,8 +21,11 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use relay_domain::outcome::{Class, Transport, classify_status, classify_transport};
-use relay_store::{DeliveryStatus, PendingDelivery, Store};
+use relay_domain::{
+    backoff::Backoff,
+    outcome::{Class, Transport, classify_status, classify_transport},
+};
+use relay_store::{AttemptResult, PendingDelivery, Store};
 use tokio::{sync::Semaphore, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -93,10 +96,15 @@ pub struct Sender {
     /// Identifies which process holds a claim. The reaper uses it to attribute
     /// stranded work.
     worker_id: String,
+    backoff: Backoff,
 }
 
 impl Sender {
     pub fn new(store: Store) -> Self {
+        Self::with_backoff(store, Backoff::default())
+    }
+
+    pub fn with_backoff(store: Store, backoff: Backoff) -> Self {
         let client = reqwest::Client::builder()
             // Three separate limits. A missing *total* timeout is the classic way a
             // worker pool dies: a per-read timeout resets on every byte, so a slow
@@ -110,7 +118,39 @@ impl Sender {
             store,
             client,
             worker_id: format!("sender-{}", uuid::Uuid::new_v4()),
+            backoff,
         }
+    }
+
+    /// What happens to a delivery after a failed attempt.
+    ///
+    /// The three-way split is the whole point of the classifier. A permanent failure
+    /// stops immediately rather than spending eleven more attempts proving that a
+    /// `404` is still a `404` — which is both waste and, from the endpoint's side,
+    /// indistinguishable from being attacked.
+    fn next_step(
+        &self,
+        class: Class,
+        attempt: i32,
+        retry_after: Option<Duration>,
+    ) -> AttemptResult {
+        if class != Class::Retryable {
+            return AttemptResult::Dead;
+        }
+
+        let attempt = attempt.max(0) as u32;
+        if !self.backoff.attempts_remain(attempt) {
+            return AttemptResult::Dead;
+        }
+
+        // The endpoint's own answer wins when it gave one — a rate limiter knows
+        // when its window resets and we do not. Clamped, so a header of `86400`
+        // cannot park a delivery for a day.
+        let delay = match retry_after {
+            Some(requested) => self.backoff.retry_after(requested),
+            None => self.backoff.next_delay(attempt, rand::random::<f64>()),
+        };
+        AttemptResult::Retry { delay }
     }
 
     /// Take the next due delivery, if any, and attempt it.
@@ -176,10 +216,18 @@ impl Sender {
 
         let latency_ms = started.elapsed().as_millis() as i32;
 
-        let (outcome, http_status, error, snippet) = match result {
+        let (outcome, http_status, error, snippet, retry_after) = match result {
             Ok(resp) => {
                 let status = resp.status().as_u16();
                 let class = classify_status(status);
+                // Read before consuming the response body. An endpoint under a rate
+                // limit knows exactly when its window resets, which is better
+                // information than our schedule can derive.
+                let retry_after = resp
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(relay_domain::backoff::parse_retry_after);
                 let body = resp.text().await.unwrap_or_default();
                 let snippet = truncate(&body, SNIPPET_BYTES);
                 if class == Class::Success {
@@ -188,6 +236,7 @@ impl Sender {
                         Some(status as i32),
                         None,
                         Some(snippet),
+                        retry_after,
                     )
                 } else {
                     (
@@ -199,6 +248,7 @@ impl Sender {
                         Some(status as i32),
                         Some(format!("HTTP {status}")),
                         Some(snippet),
+                        retry_after,
                     )
                 }
             }
@@ -211,16 +261,15 @@ impl Sender {
                 None,
                 Some(e.to_string()),
                 None,
+                None,
             ),
         };
 
-        let (outcome_class, final_status) = match &outcome {
-            Outcome::Succeeded { .. } => (Class::Success, DeliveryStatus::Succeeded),
-            // The class is recorded but not yet acted on: #11 is what turns a
-            // retryable failure into a rescheduled attempt. Until then every failure
-            // is still terminal, and the attempt log says which ones should not have
-            // been.
-            Outcome::Failed { class, .. } => (*class, DeliveryStatus::Dead),
+        let (outcome_class, result) = match &outcome {
+            Outcome::Succeeded { .. } => (Class::Success, AttemptResult::Succeeded),
+            Outcome::Failed { class, .. } => {
+                (*class, self.next_step(*class, p.attempt, retry_after))
+            }
         };
         let outcome_class = outcome_class.as_str();
 
@@ -231,7 +280,7 @@ impl Sender {
             .finish_attempt(
                 p.delivery_id,
                 p.attempt,
-                final_status,
+                result,
                 http_status,
                 latency_ms,
                 outcome_class,
@@ -294,8 +343,12 @@ pub struct Pool {
 
 impl Pool {
     pub fn new(store: Store, config: PoolConfig) -> Self {
+        Self::with_backoff(store, config, Backoff::default())
+    }
+
+    pub fn with_backoff(store: Store, config: PoolConfig, backoff: Backoff) -> Self {
         Self {
-            sender: Sender::new(store),
+            sender: Sender::with_backoff(store, backoff),
             capacity: Arc::new(Semaphore::new(config.workers)),
             config,
         }
