@@ -1295,6 +1295,7 @@ dependencies = [
  "relay-testkit",
  "reqwest",
  "serde_json",
+ "sqlx",
  "thiserror",
  "tokio",
  "tracing",
