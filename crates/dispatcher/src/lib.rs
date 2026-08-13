@@ -23,6 +23,7 @@ use std::{
 
 use relay_store::{DeliveryStatus, PendingDelivery, Store};
 use tokio::{sync::Semaphore, task::JoinSet};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 /// Customer error pages can be enormous. Store enough to debug with, no more.
@@ -224,6 +225,11 @@ pub struct PoolConfig {
     pub batch_size: usize,
     /// How long to wait before asking again once the queue comes back empty.
     pub idle_poll: Duration,
+    /// How long a shutdown will wait for in-flight requests before giving up on
+    /// them. Must be finite: an endpoint that never answers would otherwise hold
+    /// the process open until the orchestrator loses patience and sends SIGKILL,
+    /// which is the ungraceful shutdown this exists to avoid.
+    pub shutdown_deadline: Duration,
 }
 
 impl Default for PoolConfig {
@@ -232,6 +238,9 @@ impl Default for PoolConfig {
             workers: 32,
             batch_size: 32,
             idle_poll: Duration::from_millis(250),
+            // Longer than one request timeout, so a request that started just before
+            // the signal still gets its full budget to finish.
+            shutdown_deadline: REQUEST_TIMEOUT + Duration::from_secs(5),
         }
     }
 }
@@ -265,7 +274,11 @@ impl Pool {
     ///
     /// Returns the number claimed, or `None` when every worker is busy — the
     /// caller must then wait for capacity rather than spinning on the database.
-    async fn claim_and_spawn(&self, tasks: &mut JoinSet<()>) -> Result<Option<usize>, SendError> {
+    async fn claim_and_spawn(
+        &self,
+        tasks: &mut JoinSet<()>,
+        cancel: &CancellationToken,
+    ) -> Result<Option<usize>, SendError> {
         // Reap finished tasks so the set does not grow without bound over the life
         // of the process. Non-blocking: anything still running is left alone.
         while tasks.try_join_next().is_some() {}
@@ -287,6 +300,17 @@ impl Pool {
         let claimed = batch.len();
 
         for pending in batch {
+            // Shutdown can land between claiming a batch and handing it out. Those
+            // rows are `inflight` with nobody about to send them, so give them back
+            // now rather than leaving the reaper to find them in half a minute.
+            if cancel.is_cancelled() {
+                if let Err(e) = self.sender.store.release(pending.delivery_id).await {
+                    tracing::error!(delivery_id = %pending.delivery_id, error = %e,
+                        "could not release a claimed delivery during shutdown");
+                }
+                continue;
+            }
+
             // Cannot block: `want` permits were free a moment ago and this is the
             // only task that acquires them, so the count has only risen since.
             let permit = self
@@ -319,18 +343,29 @@ impl Pool {
     /// the next, so one slow endpoint cannot hold up the rest.
     pub async fn run_once(&self) -> Result<usize, SendError> {
         let mut tasks = JoinSet::new();
-        let claimed = self.claim_and_spawn(&mut tasks).await?.unwrap_or(0);
+        let claimed = self
+            .claim_and_spawn(&mut tasks, &CancellationToken::new())
+            .await?
+            .unwrap_or(0);
         while tasks.join_next().await.is_some() {}
         Ok(claimed)
     }
 
-    /// Drain the queue forever.
-    pub async fn run(&self) -> ! {
+    /// Drain the queue until cancelled, then finish what is in hand.
+    pub async fn run(&self, cancel: CancellationToken) {
         let mut tasks = JoinSet::new();
-        loop {
-            match self.claim_and_spawn(&mut tasks).await {
-                // Queue empty. Nothing to do but wait.
-                Ok(Some(0)) => tokio::time::sleep(self.config.idle_poll).await,
+
+        while !cancel.is_cancelled() {
+            match self.claim_and_spawn(&mut tasks, &cancel).await {
+                // Queue empty. Nothing to do but wait — and waking early on
+                // cancellation is what keeps shutdown from taking a whole poll
+                // interval to notice.
+                Ok(Some(0)) => {
+                    tokio::select! {
+                        _ = tokio::time::sleep(self.config.idle_poll) => {}
+                        _ = cancel.cancelled() => {}
+                    }
+                }
                 // Work started. Go straight back for more — deliveries already in
                 // flight keep running while the next batch is claimed, which is what
                 // stops a hanging endpoint from stalling healthy ones.
@@ -338,13 +373,57 @@ impl Pool {
                 // Every worker busy. Park until one finishes instead of hammering
                 // the database with claims that can have nowhere to go.
                 Ok(None) => {
-                    let _ = self.capacity.acquire().await;
+                    tokio::select! {
+                        _ = self.capacity.acquire() => {}
+                        _ = cancel.cancelled() => {}
+                    }
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "claim failed");
-                    tokio::time::sleep(self.config.idle_poll).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(self.config.idle_poll) => {}
+                        _ = cancel.cancelled() => {}
+                    }
                 }
             }
+        }
+
+        self.drain(tasks).await;
+    }
+
+    /// Let in-flight deliveries finish, up to the deadline.
+    ///
+    /// Deliberately not cancelling them. A request that has already gone out may
+    /// well have arrived, so dropping it mid-flight does not undo anything — it only
+    /// throws away the answer, leaving a row that has to be reaped and re-sent to an
+    /// endpoint that already has it. Waiting is both kinder and cheaper.
+    async fn drain(&self, mut tasks: JoinSet<()>) {
+        if tasks.is_empty() {
+            tracing::info!("shutdown: nothing in flight");
+            return;
+        }
+
+        tracing::info!(
+            in_flight = tasks.len(),
+            "shutdown: draining in-flight deliveries"
+        );
+        let drained = tokio::time::timeout(self.config.shutdown_deadline, async {
+            while tasks.join_next().await.is_some() {}
+        })
+        .await;
+
+        if drained.is_err() {
+            // Whatever is left is stuck on an endpoint that is not answering. Their
+            // rows stay `inflight` and the reaper returns them once the lease
+            // expires, which is exactly the case it exists for.
+            tracing::warn!(
+                abandoned = tasks.len(),
+                deadline = ?self.config.shutdown_deadline,
+                "shutdown deadline exceeded; abandoned deliveries will be reaped"
+            );
+            tasks.abort_all();
+        } else {
+            tracing::info!("shutdown: all in-flight deliveries finished");
         }
     }
 }
@@ -432,12 +511,18 @@ impl Reaper {
         Ok(n)
     }
 
-    pub async fn run(&self) -> ! {
+    pub async fn run(&self, cancel: CancellationToken) {
         loop {
             if let Err(e) = self.reap_once().await {
                 tracing::error!(error = %e, "reaper failed");
             }
-            tokio::time::sleep(self.config.interval).await;
+            tokio::select! {
+                _ = tokio::time::sleep(self.config.interval) => {}
+                _ = cancel.cancelled() => {
+                    tracing::info!(rescued = self.rescued(), "reaper stopped");
+                    return;
+                }
+            }
         }
     }
 }
