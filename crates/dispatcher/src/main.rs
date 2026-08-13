@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use relay_dispatcher::Sender;
+use relay_dispatcher::{Pool, PoolConfig};
 use relay_store::Store;
 
 #[tokio::main]
@@ -10,22 +10,35 @@ async fn main() -> anyhow::Result<()> {
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://relay:relay@localhost:5433/relay".into());
 
-    let store = Store::connect(&database_url, 5).await?;
+    let config = PoolConfig {
+        workers: env_usize("RELAY_WORKERS", 32)?,
+        batch_size: env_usize("RELAY_BATCH_SIZE", 32)?,
+        idle_poll: Duration::from_millis(env_usize("RELAY_IDLE_POLL_MS", 250)? as u64),
+    };
+
+    // Connections are held only for the claim and for recording the outcome, never
+    // across the outbound request, so the pool does not need one per worker. It does
+    // need enough that workers finishing together are not queueing for one.
+    let db_connections = env_usize("RELAY_DB_CONNECTIONS", 8)?;
+
+    let store = Store::connect(&database_url, db_connections as u32).await?;
     store.migrate().await?;
-    let sender = Sender::new(store);
 
-    tracing::info!("relay-dispatcher started");
+    tracing::info!(
+        workers = config.workers,
+        batch_size = config.batch_size,
+        db_connections,
+        "relay-dispatcher started"
+    );
 
-    // M1: poll one delivery at a time. M2 replaces this with a claim batch and a
-    // pool of workers.
-    loop {
-        match sender.deliver_next().await {
-            Ok(Some(outcome)) => tracing::info!(?outcome, "delivered"),
-            Ok(None) => tokio::time::sleep(Duration::from_millis(250)).await,
-            Err(e) => {
-                tracing::error!(error = %e, "delivery loop error");
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        }
+    Pool::new(store, config).run().await
+}
+
+fn env_usize(key: &str, default: usize) -> anyhow::Result<usize> {
+    match std::env::var(key) {
+        Ok(v) => v
+            .parse()
+            .map_err(|_| anyhow::anyhow!("{key} must be a positive integer, got {v:?}")),
+        Err(_) => Ok(default),
     }
 }
