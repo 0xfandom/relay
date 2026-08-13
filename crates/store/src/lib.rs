@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 pub mod models;
 
-pub use models::{Attempt, Delivery, Endpoint, PendingDelivery};
+pub use models::{Attempt, DeadLetter, Delivery, Endpoint, PendingDelivery};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -389,10 +389,12 @@ impl Store {
         sqlx::query(
             "INSERT INTO delivery_attempts
                  (delivery_id, attempt_no, http_status, latency_ms, outcome_class,
-                  error, response_snippet, worker_id, next_attempt_at)
+                  error, response_snippet, worker_id, next_attempt_at,
+                  generation)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
                      CASE WHEN $9::double precision IS NULL THEN NULL
-                          ELSE now() + make_interval(secs => $9) END)",
+                          ELSE now() + make_interval(secs => $9) END,
+                     (SELECT generation FROM deliveries WHERE id = $1))",
         )
         .bind(delivery_id)
         .bind(attempt_no)
@@ -415,6 +417,7 @@ impl Store {
                  attempt = attempt + 1,
                  locked_at = NULL,
                  locked_by = NULL,
+                 dead_reason = $4,
                  next_attempt_at = CASE
                      WHEN $3::double precision IS NULL THEN next_attempt_at
                      ELSE now() + make_interval(secs => $3)
@@ -424,11 +427,114 @@ impl Store {
         .bind(delivery_id)
         .bind(result.status().as_str())
         .bind(result.retry_delay().map(|d| d.as_secs_f64()))
+        .bind(result.dead_reason().map(|r| r.as_str()))
         .execute(&mut *tx)
         .await?;
 
         tx.commit().await?;
         Ok(())
+    }
+
+    // -------------------------------------------------------------- dead letters
+
+    /// List parked deliveries, newest first.
+    ///
+    /// The filters are all optional and all bound rather than interpolated, so one
+    /// query plan serves every combination: a `NULL` parameter simply disables its
+    /// clause.
+    pub async fn dead_letters(
+        &self,
+        filter: &DeadLetterFilter,
+        limit: i64,
+    ) -> Result<Vec<DeadLetter>> {
+        let rows = sqlx::query_as::<_, DeadLetter>(
+            "SELECT d.id            AS delivery_id,
+                    d.endpoint_id   AS endpoint_id,
+                    d.event_id      AS event_id,
+                    e.event_type    AS event_type,
+                    ep.url          AS url,
+                    d.attempt       AS attempt,
+                    d.generation    AS generation,
+                    d.dead_reason   AS dead_reason,
+                    d.created_at    AS created_at
+             FROM deliveries d
+             JOIN events    e  ON e.id  = d.event_id
+             JOIN endpoints ep ON ep.id = d.endpoint_id
+             WHERE d.status = 'dead'
+               AND ($1::uuid IS NULL OR d.endpoint_id = $1)
+               AND ($2::text IS NULL OR d.dead_reason = $2)
+               AND ($3::text IS NULL OR e.event_type  = $3)
+             ORDER BY d.created_at DESC
+             LIMIT $4",
+        )
+        .bind(filter.endpoint_id)
+        .bind(filter.reason.map(|r| r.as_str()))
+        .bind(filter.event_type.as_deref())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Put one dead delivery back in the queue.
+    ///
+    /// Returns false if it does not exist or is not dead. Replaying something that
+    /// is merely slow would hand a second worker a delivery the first is still
+    /// sending.
+    pub async fn replay(&self, delivery_id: Uuid) -> Result<bool> {
+        let n = sqlx::query(
+            "UPDATE deliveries SET
+                 status          = 'pending',
+                 dead_reason     = NULL,
+                 attempt         = 0,
+                 generation      = generation + 1,
+                 next_attempt_at = now(),
+                 locked_at       = NULL,
+                 locked_by       = NULL
+             WHERE id = $1 AND status = 'dead'",
+        )
+        .bind(delivery_id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(n == 1)
+    }
+
+    /// Put a filtered set of dead deliveries back in the queue.
+    ///
+    /// `limit` is required rather than optional. An unfiltered replay of a queue
+    /// holding a million deliveries would schedule all of them at once, aimed at an
+    /// endpoint that has only just recovered — the exact flood the jittered backoff
+    /// exists to prevent, delivered deliberately.
+    pub async fn replay_many(&self, filter: &DeadLetterFilter, limit: i64) -> Result<u64> {
+        let n = sqlx::query(
+            "UPDATE deliveries SET
+                 status          = 'pending',
+                 dead_reason     = NULL,
+                 attempt         = 0,
+                 generation      = generation + 1,
+                 next_attempt_at = now(),
+                 locked_at       = NULL,
+                 locked_by       = NULL
+             WHERE id IN (
+                 SELECT d.id FROM deliveries d
+                 JOIN events e ON e.id = d.event_id
+                 WHERE d.status = 'dead'
+                   AND ($1::uuid IS NULL OR d.endpoint_id = $1)
+                   AND ($2::text IS NULL OR d.dead_reason = $2)
+                   AND ($3::text IS NULL OR e.event_type  = $3)
+                 ORDER BY d.created_at
+                 LIMIT $4
+             )",
+        )
+        .bind(filter.endpoint_id)
+        .bind(filter.reason.map(|r| r.as_str()))
+        .bind(filter.event_type.as_deref())
+        .bind(limit)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(n)
     }
 
     /// Every attempt made on a delivery, oldest first.
@@ -438,10 +544,10 @@ impl Store {
     pub async fn attempt_history(&self, delivery_id: Uuid) -> Result<Vec<Attempt>> {
         let rows = sqlx::query_as::<_, Attempt>(
             "SELECT delivery_id, attempt_no, http_status, latency_ms, outcome_class,
-                    error, response_snippet, worker_id, next_attempt_at, at
+                    generation, error, response_snippet, worker_id, next_attempt_at, at
              FROM delivery_attempts
              WHERE delivery_id = $1
-             ORDER BY attempt_no",
+             ORDER BY generation, attempt_no",
         )
         .bind(delivery_id)
         .fetch_all(&self.pool)
@@ -499,8 +605,42 @@ pub enum AttemptResult {
     Retry {
         delay: Duration,
     },
-    /// Permanently failed, or out of attempts.
-    Dead,
+    /// Given up on, for the recorded reason.
+    Dead {
+        reason: DeadReason,
+    },
+}
+
+/// Why a delivery was given up on.
+///
+/// The two need completely different responses. A permanent failure means the URL
+/// or the payload is wrong and someone has to change something. Exhausted attempts
+/// mean the endpoint was down longer than the retry budget, and a replay once it is
+/// back will probably just work. Recording only "dead" makes those indistinguishable
+/// and the queue untriageable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeadReason {
+    /// The first attempt already showed it would never work.
+    PermanentFailure,
+    /// It might have worked, and we ran out of tries.
+    AttemptsExhausted,
+}
+
+impl DeadReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PermanentFailure => "permanent_failure",
+            Self::AttemptsExhausted => "attempts_exhausted",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "permanent_failure" => Some(Self::PermanentFailure),
+            "attempts_exhausted" => Some(Self::AttemptsExhausted),
+            _ => None,
+        }
+    }
 }
 
 impl AttemptResult {
@@ -508,7 +648,7 @@ impl AttemptResult {
         match self {
             Self::Succeeded => DeliveryStatus::Succeeded,
             Self::Retry { .. } => DeliveryStatus::Pending,
-            Self::Dead => DeliveryStatus::Dead,
+            Self::Dead { .. } => DeliveryStatus::Dead,
         }
     }
 
@@ -518,4 +658,23 @@ impl AttemptResult {
             _ => None,
         }
     }
+
+    pub fn dead_reason(self) -> Option<DeadReason> {
+        match self {
+            Self::Dead { reason } => Some(reason),
+            _ => None,
+        }
+    }
+}
+
+/// Which dead letters to act on.
+///
+/// Every field is optional, but [`Store::replay_many`] takes a `limit` separately
+/// and requires one. An unfiltered replay of a queue holding a million deliveries is
+/// almost never what someone meant to do.
+#[derive(Debug, Clone, Default)]
+pub struct DeadLetterFilter {
+    pub endpoint_id: Option<Uuid>,
+    pub reason: Option<DeadReason>,
+    pub event_type: Option<String>,
 }
