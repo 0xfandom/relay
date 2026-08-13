@@ -14,6 +14,7 @@
 //! rather than about when to send again.
 
 use std::{
+    net::{IpAddr, SocketAddr},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -23,7 +24,8 @@ use std::{
 
 use relay_domain::{
     backoff::Backoff,
-    outcome::{Class, Transport, classify_status, classify_transport, disposition},
+    outcome::{Class, Disposition, Transport, classify_status, classify_transport, disposition},
+    url_guard::{Policy, Refused},
 };
 use relay_store::{AttemptResult, DeadReason, PendingDelivery, Store};
 use tokio::{sync::Semaphore, task::JoinSet};
@@ -86,6 +88,48 @@ fn transport_of(e: &reqwest::Error) -> Transport {
     }
 }
 
+/// A DNS resolver that refuses to hand back internal addresses.
+///
+/// The last line of defence, and the only one without a gap. [`Sender`] also checks
+/// before sending, but that check and the connection are two separate lookups, and a
+/// resolver under the attacker's control can answer honestly for the first and
+/// dishonestly for the second — DNS rebinding. Enforcing inside the client's own
+/// resolver means the address that was approved *is* the address connected to.
+struct GuardedResolver {
+    policy: Policy,
+}
+
+impl reqwest::dns::Resolve for GuardedResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let policy = self.policy;
+        Box::pin(async move {
+            let addrs = resolve_host(name.as_str(), 0).await;
+            let ips: Vec<IpAddr> = addrs.iter().map(|a| a.ip()).collect();
+            policy.check_addrs(&ips)?;
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// Look a host up, returning every address it answers with.
+async fn resolve_host(host: &str, port: u16) -> Vec<SocketAddr> {
+    // A bare address needs no lookup, and asking the resolver about one invites an
+    // unnecessary round trip.
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return vec![SocketAddr::new(ip, port)];
+    }
+    // Brackets around an IPv6 literal are URL syntax, not part of the address.
+    if let Some(inner) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']'))
+        && let Ok(ip) = inner.parse::<IpAddr>()
+    {
+        return vec![SocketAddr::new(ip, port)];
+    }
+    tokio::net::lookup_host((host, port))
+        .await
+        .map(|it| it.collect())
+        .unwrap_or_default()
+}
+
 /// Cloning is cheap and shares state: `Store` clones share one connection pool and
 /// `reqwest::Client` clones share one connection pool too. The worker pool hands a
 /// clone to every spawned task, so this must not mean "open more sockets".
@@ -96,30 +140,70 @@ pub struct Sender {
     /// Identifies which process holds a claim. The reaper uses it to attribute
     /// stranded work.
     worker_id: String,
-    backoff: Backoff,
+    config: SenderConfig,
+}
+
+/// How one delivery attempt behaves.
+#[derive(Debug, Clone, Default)]
+pub struct SenderConfig {
+    pub backoff: Backoff,
+    /// Where deliveries are allowed to go. Strict by default — see [`Policy`].
+    pub policy: Policy,
 }
 
 impl Sender {
     pub fn new(store: Store) -> Self {
-        Self::with_backoff(store, Backoff::default())
+        Self::with_config(store, SenderConfig::default())
     }
 
     pub fn with_backoff(store: Store, backoff: Backoff) -> Self {
+        Self::with_config(
+            store,
+            SenderConfig {
+                backoff,
+                ..Default::default()
+            },
+        )
+    }
+
+    pub fn with_config(store: Store, config: SenderConfig) -> Self {
         let client = reqwest::Client::builder()
             // Three separate limits. A missing *total* timeout is the classic way a
             // worker pool dies: a per-read timeout resets on every byte, so a slow
             // trickle can hold a connection open indefinitely.
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
+            // Not following redirects is a security control as much as a simplicity
+            // one: a `302` is the easiest way for a URL that passed validation to end
+            // up pointing at an internal address.
             .redirect(reqwest::redirect::Policy::none())
+            .dns_resolver(Arc::new(GuardedResolver {
+                policy: config.policy,
+            }))
             .build()
             .expect("reqwest client builds with static configuration");
         Self {
             store,
             client,
             worker_id: format!("sender-{}", uuid::Uuid::new_v4()),
-            backoff,
+            config,
         }
+    }
+
+    /// Refuse a URL that points anywhere but the public internet.
+    ///
+    /// Checked at send time rather than only at registration. A domain that was
+    /// public last week can be repointed at an internal address today, and endpoints
+    /// stored before this existed were never checked at all.
+    async fn check_destination(&self, url: &str) -> Result<(), Refused> {
+        let parsed = reqwest::Url::parse(url).map_err(|_| Refused::NoHost)?;
+        self.config.policy.check_scheme(parsed.scheme())?;
+        let host = parsed.host_str().ok_or(Refused::NoHost)?;
+        let port = parsed.port_or_known_default().unwrap_or(80);
+
+        let addrs = resolve_host(host, port).await;
+        let ips: Vec<IpAddr> = addrs.iter().map(|a| a.ip()).collect();
+        self.config.policy.check_addrs(&ips)
     }
 
     /// What happens to a delivery after a failed attempt.
@@ -141,7 +225,7 @@ impl Sender {
         }
 
         let attempt = attempt.max(0) as u32;
-        if !self.backoff.attempts_remain(attempt) {
+        if !self.config.backoff.attempts_remain(attempt) {
             // Distinguished from a permanent failure because the response is
             // different: this one might well work now that the endpoint is back, and
             // is worth replaying. A permanent failure needs someone to change
@@ -155,10 +239,49 @@ impl Sender {
         // when its window resets and we do not. Clamped, so a header of `86400`
         // cannot park a delivery for a day.
         let delay = match retry_after {
-            Some(requested) => self.backoff.retry_after(requested),
-            None => self.backoff.next_delay(attempt, rand::random::<f64>()),
+            Some(requested) => self.config.backoff.retry_after(requested),
+            None => self
+                .config
+                .backoff
+                .next_delay(attempt, rand::random::<f64>()),
         };
         AttemptResult::Retry { delay }
+    }
+
+    /// Record a delivery that was never sent because its destination was refused.
+    async fn refuse(&self, p: PendingDelivery, refused: Refused) -> Result<Outcome, SendError> {
+        let error = refused.to_string();
+        tracing::warn!(
+            delivery_id = %p.delivery_id,
+            endpoint_id = %p.endpoint_id,
+            reason = %error,
+            "refused to deliver to a non-public address"
+        );
+
+        self.store
+            .finish_attempt(
+                p.delivery_id,
+                p.attempt,
+                AttemptResult::Dead {
+                    reason: DeadReason::PermanentFailure,
+                },
+                None,
+                0,
+                Disposition::Permanent.as_str(),
+                Some(&error),
+                // Deliberately no snippet. There is no response — and if there ever
+                // were one, handing it to the party who chose the address is the
+                // second half of the vulnerability, not just the first.
+                None,
+                &self.worker_id,
+            )
+            .await?;
+
+        Ok(Outcome::Failed {
+            class: Class::Permanent,
+            status: None,
+            error,
+        })
     }
 
     /// Take the next due delivery, if any, and attempt it.
@@ -197,6 +320,14 @@ impl Sender {
     /// unclaimed row would reintroduce the duplicate-send bug, so the only callers
     /// are ones that have just claimed it.
     pub async fn deliver_claimed(&self, p: PendingDelivery) -> Result<Outcome, SendError> {
+        // Before anything is signed or sent. A refused destination is permanent — no
+        // amount of retrying makes an internal address public — and nothing about the
+        // refusal is written back to the caller's response snippet, because the party
+        // who chose the URL must not learn what is listening at it.
+        if let Err(refused) = self.check_destination(&p.url).await {
+            return self.refuse(p, refused).await;
+        }
+
         let timestamp = unix_now();
 
         // Sign the stored bytes, and send those same bytes. Nothing in between may
@@ -358,8 +489,19 @@ impl Pool {
     }
 
     pub fn with_backoff(store: Store, config: PoolConfig, backoff: Backoff) -> Self {
+        Self::with_config(
+            store,
+            config,
+            SenderConfig {
+                backoff,
+                ..Default::default()
+            },
+        )
+    }
+
+    pub fn with_config(store: Store, config: PoolConfig, sender: SenderConfig) -> Self {
         Self {
-            sender: Sender::with_backoff(store, backoff),
+            sender: Sender::with_config(store, sender),
             capacity: Arc::new(Semaphore::new(config.workers)),
             config,
         }

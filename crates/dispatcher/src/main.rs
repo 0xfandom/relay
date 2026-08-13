@@ -1,6 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
-use relay_dispatcher::{Pool, PoolConfig, REQUEST_TIMEOUT, Reaper, ReaperConfig};
+use relay_dispatcher::{Pool, PoolConfig, REQUEST_TIMEOUT, Reaper, ReaperConfig, SenderConfig};
+use relay_domain::url_guard::Policy;
 use relay_store::Store;
 use tokio_util::sync::CancellationToken;
 
@@ -30,6 +31,19 @@ async fn main() -> anyhow::Result<()> {
         interval: Duration::from_secs(env_usize("RELAY_REAP_INTERVAL_SECS", 10)? as u64),
     };
 
+    // Off unless explicitly enabled. Relay will make an HTTP request to any URL a
+    // customer registers, from inside a private network, so allowing internal
+    // addresses turns it into a server-side request forgery engine — the cloud
+    // metadata service answers without authentication to anything on the box.
+    // Local development needs it, because every receiver is on loopback there.
+    let allow_private = std::env::var("RELAY_ALLOW_PRIVATE_ENDPOINTS")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+    let sender_config = SenderConfig {
+        backoff: Default::default(),
+        policy: Policy { allow_private },
+    };
+
     let store = Store::connect(&database_url, db_connections as u32).await?;
     store.migrate().await?;
 
@@ -44,8 +58,16 @@ async fn main() -> anyhow::Result<()> {
         lease_ttl = ?reaper_config.lease_ttl,
         request_timeout = ?REQUEST_TIMEOUT,
         shutdown_deadline = ?config.shutdown_deadline,
+        allow_private_endpoints = allow_private,
         "relay-dispatcher started"
     );
+
+    if allow_private {
+        tracing::warn!(
+            "RELAY_ALLOW_PRIVATE_ENDPOINTS is on: deliveries may reach internal \
+             addresses, including the cloud metadata service. Development only."
+        );
+    }
 
     // One token, every loop. A shutdown that stopped some loops and not others would
     // leave the reaper rescuing work that the pool is no longer around to send.
@@ -65,7 +87,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Returns once cancelled and everything in flight has finished or hit the
     // deadline.
-    Pool::new(store, config).run(cancel).await;
+    Pool::with_config(store, config, sender_config)
+        .run(cancel)
+        .await;
     let _ = reaper_loop.await;
 
     tracing::info!("relay-dispatcher stopped");
