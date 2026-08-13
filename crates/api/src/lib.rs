@@ -13,6 +13,7 @@ use axum::{
     routing::{get, post},
 };
 use rand::RngExt;
+use relay_domain::url_guard::Policy;
 use relay_store::{DeadLetterFilter, DeadReason, Store};
 use serde::{Deserialize, Serialize};
 
@@ -65,6 +66,19 @@ async fn create_endpoint(
     State(state): State<AppState>,
     Json(req): Json<CreateEndpoint>,
 ) -> Result<Response, ApiError> {
+    // Fast feedback only. The gate that matters is in the dispatcher, at send time:
+    // a domain that is public today can be repointed at an internal address
+    // tomorrow, and only the address resolved at the moment of connecting is worth
+    // trusting. Rejecting an obviously bad URL here saves the caller a round trip
+    // and a delivery that was always going to be refused.
+    let parsed = reqwest_url(&req.url)?;
+    Policy::default()
+        .check_scheme(parsed.scheme())
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    if parsed.host_str().is_none() {
+        return Err(ApiError::BadRequest("url has no host".into()));
+    }
+
     let secret = generate_secret();
     let ep = state
         .store
@@ -80,6 +94,10 @@ async fn create_endpoint(
         }),
     )
         .into_response())
+}
+
+fn reqwest_url(url: &str) -> Result<url::Url, ApiError> {
+    url::Url::parse(url).map_err(|e| ApiError::BadRequest(format!("invalid url: {e}")))
 }
 
 /// 32 bytes of randomness, hex encoded, with a prefix that makes an accidentally
