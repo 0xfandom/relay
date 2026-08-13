@@ -40,6 +40,50 @@ impl Class {
     }
 }
 
+/// What gets recorded for an attempt.
+///
+/// One more variant than [`Class`], because there is a distinction the classifier
+/// cannot make on its own: whether the endpoint *asked* us to wait.
+///
+/// An endpoint answering `429` with a `Retry-After` is not failing. It is working
+/// correctly and telling us to slow down. Recording that as an error makes a
+/// customer who is merely rate limited look like one whose server is broken — the
+/// difference between an alert worth waking someone for and noise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Disposition {
+    Success,
+    /// Retryable, and the endpoint told us when to come back.
+    Deferred,
+    /// Retryable, on our own schedule.
+    Retryable,
+    Permanent,
+}
+
+impl Disposition {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Deferred => "deferred",
+            Self::Retryable => "retryable",
+            Self::Permanent => "permanent",
+        }
+    }
+}
+
+/// What to record for an attempt of class `class`.
+///
+/// `endpoint_asked_to_wait` is whether the response carried a usable `Retry-After`.
+/// It only matters for retryable failures: a `Retry-After` on a `404` is the
+/// endpoint being confused, and honouring it would not make the URL exist.
+pub fn disposition(class: Class, endpoint_asked_to_wait: bool) -> Disposition {
+    match class {
+        Class::Success => Disposition::Success,
+        Class::Permanent => Disposition::Permanent,
+        Class::Retryable if endpoint_asked_to_wait => Disposition::Deferred,
+        Class::Retryable => Disposition::Retryable,
+    }
+}
+
 /// Why a request never produced a response.
 ///
 /// Deliberately not `reqwest::Error`. This crate has no HTTP client and must not
@@ -205,6 +249,46 @@ mod tests {
                 "{status} classified as success={is_success}"
             );
         }
+    }
+
+    #[test]
+    fn a_deferral_is_recorded_separately_from_a_failure() {
+        // The endpoint asked us to wait, which is not the same as the endpoint being
+        // broken. Anything grouping by this column has to be able to tell them apart.
+        assert_eq!(
+            disposition(Class::Retryable, true),
+            Disposition::Deferred,
+            "429 with Retry-After is a deferral"
+        );
+        assert_eq!(disposition(Class::Retryable, false), Disposition::Retryable);
+    }
+
+    #[test]
+    fn only_retryable_failures_can_be_deferred() {
+        // A Retry-After on a 404 is the endpoint being confused. Honouring it would
+        // not make the URL exist, and recording it as a deferral would hide a real
+        // misconfiguration behind a benign-looking class.
+        assert_eq!(disposition(Class::Permanent, true), Disposition::Permanent);
+        assert_eq!(disposition(Class::Success, true), Disposition::Success);
+    }
+
+    #[test]
+    fn every_disposition_has_a_distinct_name() {
+        // These strings are a database CHECK constraint and a metric label. Two
+        // variants sharing a name would silently merge them.
+        let names: Vec<&str> = [
+            Disposition::Success,
+            Disposition::Deferred,
+            Disposition::Retryable,
+            Disposition::Permanent,
+        ]
+        .iter()
+        .map(|d| d.as_str())
+        .collect();
+        let mut unique = names.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len(), "duplicate names in {names:?}");
     }
 
     #[test]
