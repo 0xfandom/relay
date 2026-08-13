@@ -69,6 +69,8 @@ standing in for a customer endpoint.
 
 ```bash
 export DATABASE_URL=postgres://relay:relay@localhost:5433/relay
+# The receiver below runs on loopback, which the dispatcher refuses by default.
+export RELAY_ALLOW_PRIVATE_ENDPOINTS=true
 
 RELAY_TESTKIT_SECRET=whsec_demo cargo run -p relay-testkit   # :9090
 cargo run -p relay-api                                       # :8080
@@ -106,6 +108,27 @@ The signed string is exactly `<timestamp>.<raw body bytes>`. Signing the raw
 bytes matters: re-serialising JSON can reorder keys and invalidate every
 signature. Two signatures are sent during secret rotation so endpoints can
 migrate without failed deliveries.
+
+## Where deliveries may go
+
+Relay makes an HTTP request to whatever URL a customer registers, from a machine
+that sits inside a private network. Left unguarded that is a server-side request
+forgery engine: an endpoint registered as
+`http://169.254.169.254/latest/meta-data/iam/security-credentials/` would be fetched
+from inside the instance, where the cloud metadata service answers without
+authentication, and the stored response snippet would carry the credentials back out
+through the delivery history.
+
+So the dispatcher refuses any URL that is not `http`/`https`, and any host that
+resolves into loopback, private, link-local, carrier-NAT, multicast or reserved
+space — checked against the resolved address rather than the URL text, because
+loopback has too many spellings to blocklist. The check happens at send time, not
+only at registration, since a domain that is public today can be repointed
+tomorrow. Redirects are not followed, and a refused delivery stores no response
+body.
+
+`RELAY_ALLOW_PRIVATE_ENDPOINTS=true` disables the address check for local
+development. It is off by default and should stay off anywhere real.
 
 ## License
 
