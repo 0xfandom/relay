@@ -48,6 +48,34 @@ struct Inner {
     /// Bodies seen, for assertions about byte fidelity.
     bodies: Mutex<Vec<Vec<u8>>>,
     hits: AtomicU64,
+    /// Requests being served right now, and the high-water mark.
+    ///
+    /// A worker pool's whole job is to bound concurrency, and the only place that
+    /// bound is observable is here — from the sender's side every request looks the
+    /// same whether one is in flight or a thousand.
+    in_flight: AtomicU64,
+    max_in_flight: AtomicU64,
+}
+
+/// Counts a request as in flight for as long as the handler is running.
+///
+/// A guard rather than a pair of calls because handlers return early on every
+/// validation failure, and a decrement that is skipped on one path makes the
+/// high-water mark drift upwards forever.
+struct InFlight(Arc<Inner>);
+
+impl InFlight {
+    fn enter(inner: Arc<Inner>) -> Self {
+        let now = inner.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        inner.max_in_flight.fetch_max(now, Ordering::SeqCst);
+        Self(inner)
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Receiver {
@@ -58,6 +86,8 @@ impl Receiver {
                 received: Mutex::new(Vec::new()),
                 bodies: Mutex::new(Vec::new()),
                 hits: AtomicU64::new(0),
+                in_flight: AtomicU64::new(0),
+                max_in_flight: AtomicU64::new(0),
             }),
         }
     }
@@ -72,6 +102,11 @@ impl Receiver {
 
     pub fn hits(&self) -> u64 {
         self.inner.hits.load(Ordering::Relaxed)
+    }
+
+    /// The most requests this receiver ever had in flight at once.
+    pub fn max_in_flight(&self) -> u64 {
+        self.inner.max_in_flight.load(Ordering::SeqCst)
     }
 
     pub fn router(&self) -> Router {
@@ -98,7 +133,10 @@ impl Receiver {
     }
 }
 
-fn record(state: &Receiver, headers: &HeaderMap, body: &Bytes) {
+/// Record the request and mark it in flight. Hold the returned guard for the life
+/// of the handler.
+#[must_use]
+fn record(state: &Receiver, headers: &HeaderMap, body: &Bytes) -> InFlight {
     state.inner.hits.fetch_add(1, Ordering::Relaxed);
     if let Some(id) = headers
         .get("relay-delivery-id")
@@ -107,11 +145,12 @@ fn record(state: &Receiver, headers: &HeaderMap, body: &Bytes) {
         state.inner.received.lock().unwrap().push(id.to_string());
     }
     state.inner.bodies.lock().unwrap().push(body.to_vec());
+    InFlight::enter(state.inner.clone())
 }
 
 /// The honest receiver: checks freshness, then the signature, then accepts.
 async fn verify(State(state): State<Receiver>, headers: HeaderMap, body: Bytes) -> Response {
-    record(&state, &headers, &body);
+    let _in_flight = record(&state, &headers, &body);
 
     let Some(ts) = headers
         .get("relay-timestamp")
@@ -157,7 +196,7 @@ async fn verify(State(state): State<Receiver>, headers: HeaderMap, body: Bytes) 
 }
 
 async fn always_500(State(state): State<Receiver>, headers: HeaderMap, body: Bytes) -> Response {
-    record(&state, &headers, &body);
+    let _in_flight = record(&state, &headers, &body);
     (StatusCode::INTERNAL_SERVER_ERROR, "nope").into_response()
 }
 
@@ -176,7 +215,7 @@ async fn slow(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    record(&state, &headers, &body);
+    let _in_flight = record(&state, &headers, &body);
     tokio::time::sleep(Duration::from_millis(p.ms)).await;
     (StatusCode::OK, "slow ok").into_response()
 }
@@ -198,7 +237,7 @@ async fn flaky(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    record(&state, &headers, &body);
+    let _in_flight = record(&state, &headers, &body);
     let n = state.inner.hits.load(Ordering::Relaxed);
     if (n % 100) < p.pct {
         (StatusCode::INTERNAL_SERVER_ERROR, "flaked").into_response()
@@ -222,7 +261,7 @@ async fn too_many(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    record(&state, &headers, &body);
+    let _in_flight = record(&state, &headers, &body);
     (
         StatusCode::TOO_MANY_REQUESTS,
         [("retry-after", p.retry_after.to_string())],
