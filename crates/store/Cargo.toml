@@ -9,3 +9,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "postgres", "uuid", "chrono", "migrate", "macros"] }
 thiserror = "2.0.19"
 uuid = { version = "1.24.0", features = ["v4", "serde"] }
+
+[dev-dependencies]
+# The claim tests spawn competing workers with JoinSet.
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
