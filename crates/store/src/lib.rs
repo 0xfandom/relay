@@ -8,6 +8,8 @@
 //! but makes `cargo build` depend on a running Postgres (or a checked-in offline
 //! cache). That trade is worth making later; for now the build stays hermetic.
 
+use std::time::Duration;
+
 use serde::Serialize;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use uuid::Uuid;
@@ -185,6 +187,36 @@ impl Store {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Return deliveries whose lease has expired to the pending pool.
+    ///
+    /// A worker that dies mid-send — killed, out of memory, host lost — leaves its
+    /// rows `inflight` with nobody holding them. They are not `pending`, so the
+    /// claim query steps over them, and they would sit there undelivered forever
+    /// with nothing reporting a problem. This is the only thing that finds them.
+    ///
+    /// The attempt counter is untouched. Whether the request actually reached the
+    /// endpoint is unknown, and charging a retry for an attempt that may never have
+    /// happened spends the delivery's budget on a guess.
+    ///
+    /// `lease_ttl` must exceed the sender's total request timeout. A shorter one
+    /// rescues deliveries that are still legitimately in flight, and the endpoint
+    /// receives them twice.
+    ///
+    /// Returns how many were rescued. Zero is the expected value; anything else
+    /// means workers are dying.
+    pub async fn reap_expired_leases(&self, lease_ttl: Duration) -> Result<u64> {
+        let result = sqlx::query(
+            "UPDATE deliveries
+             SET status = 'pending', locked_at = NULL, locked_by = NULL
+             WHERE status = 'inflight'
+               AND locked_at < now() - make_interval(secs => $1)",
+        )
+        .bind(lease_ttl.as_secs_f64())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 
     // ---------------------------------------------------------------- endpoints
