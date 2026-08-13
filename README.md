@@ -55,8 +55,12 @@ Requires a recent stable Rust toolchain.
 
 ```bash
 docker compose up -d       # Postgres on 5433
+export DATABASE_URL=postgres://relay:relay@localhost:5433/relay
 cargo test                 # unit tests plus end-to-end against a real database
 ```
+
+`DATABASE_URL` is required: the store's tests create a throwaway database each, so
+that concurrent workers in one test cannot claim rows belonging to another.
 
 ## Running locally
 

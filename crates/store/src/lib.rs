@@ -28,6 +28,49 @@ pub enum StoreError {
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
+/// Selects the deliveries a worker is allowed to take, soonest deadline first.
+/// `$1` is the batch size.
+///
+/// A macro rather than a `const` so the text is a literal, which lets `concat!`
+/// paste it into the full claim below at compile time. One definition, two users:
+/// the claim that runs it, and the test that asks Postgres to `EXPLAIN` it. A test
+/// that explains a hand-copied lookalike proves nothing — the copy keeps its index
+/// while the real query quietly loses one.
+macro_rules! claim_candidates_sql {
+    () => {
+        "SELECT id FROM deliveries
+         WHERE status = 'pending' AND next_attempt_at <= now()
+         ORDER BY next_attempt_at
+         FOR UPDATE SKIP LOCKED
+         LIMIT $1"
+    };
+}
+
+/// The claim's candidate selection, wrapped in `EXPLAIN`. Exposed for the test that
+/// asserts the partial index is reachable.
+pub const EXPLAIN_CLAIM_CANDIDATES_SQL: &str = concat!("EXPLAIN ", claim_candidates_sql!());
+
+const CLAIM_BATCH_SQL: &str = concat!(
+    "WITH claimed AS (
+         UPDATE deliveries
+         SET status = 'inflight', locked_at = now(), locked_by = $2
+         WHERE id IN (",
+    claim_candidates_sql!(),
+    ")
+         RETURNING id, attempt, event_id, endpoint_id
+     )
+     SELECT c.id          AS delivery_id,
+            c.attempt     AS attempt,
+            e.event_type  AS event_type,
+            e.raw_payload AS raw_payload,
+            ep.id         AS endpoint_id,
+            ep.url        AS url,
+            ep.secret     AS secret
+     FROM claimed c
+     JOIN events    e  ON e.id  = c.event_id
+     JOIN endpoints ep ON ep.id = c.endpoint_id"
+);
+
 #[derive(Clone)]
 pub struct Store {
     pool: PgPool,
@@ -43,6 +86,15 @@ impl Store {
             .connect(database_url)
             .await?;
         Ok(Self { pool })
+    }
+
+    /// Wrap a pool that already exists.
+    ///
+    /// Used by `#[sqlx::test]`, which hands each test its own freshly migrated
+    /// database. Sharing one database between tests means they claim each other's
+    /// work and fail for reasons that have nothing to do with the code.
+    pub fn from_pool(pool: PgPool) -> Self {
+        Self { pool }
     }
 
     /// Apply any migrations that have not run yet. Safe to call on every start:
@@ -87,6 +139,52 @@ impl Store {
         .await?
         .rows_affected();
         Ok(claimed == 1)
+    }
+
+    /// Claim a batch of due deliveries for exclusive processing.
+    ///
+    /// This is the query the whole dispatcher is built around, and the interesting
+    /// part is `FOR UPDATE SKIP LOCKED`.
+    ///
+    /// `FOR UPDATE` alone locks the rows the inner select touches. With several
+    /// workers running the same query at the same instant, the second worker blocks
+    /// on the first one's locks, the third blocks behind the second, and a pool of
+    /// eight workers behaves like one worker with a queue behind it. Adding
+    /// `SKIP LOCKED` tells Postgres to pass over any row another transaction is
+    /// already holding and take the next free one instead, so each worker walks
+    /// away with a disjoint set and none of them ever waits.
+    ///
+    /// The inner `SELECT` is separate from the `UPDATE` on purpose: `LIMIT` and
+    /// `FOR UPDATE SKIP LOCKED` belong to a select, and this shape lets Postgres
+    /// use the partial index on pending rows to find candidates before locking
+    /// anything.
+    ///
+    /// The surrounding CTE returns the claimed rows joined with the payload and the
+    /// endpoint, so claiming a batch costs one round trip rather than one plus N.
+    pub async fn claim_batch(&self, limit: i64, worker: &str) -> Result<Vec<PendingDelivery>> {
+        let rows = sqlx::query_as::<_, PendingDelivery>(CLAIM_BATCH_SQL)
+            .bind(limit)
+            .bind(worker)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows)
+    }
+
+    /// Return a claimed delivery to the queue without consuming an attempt.
+    ///
+    /// Used when a worker is shutting down and will not finish what it holds. The
+    /// attempt counter is untouched: nothing was tried, so nothing should be
+    /// charged against the delivery's retry budget.
+    pub async fn release(&self, delivery_id: Uuid) -> Result<()> {
+        sqlx::query(
+            "UPDATE deliveries
+             SET status = 'pending', locked_at = NULL, locked_by = NULL
+             WHERE id = $1 AND status = 'inflight'",
+        )
+        .bind(delivery_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     // ---------------------------------------------------------------- endpoints
