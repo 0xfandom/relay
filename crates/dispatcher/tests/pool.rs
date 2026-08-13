@@ -14,7 +14,8 @@
 
 use std::{sync::Arc, time::Duration};
 
-use relay_dispatcher::{Pool, PoolConfig};
+use relay_dispatcher::{Pool, PoolConfig, SenderConfig};
+use relay_domain::url_guard::Policy;
 use relay_store::Store;
 use relay_testkit::Receiver;
 use sqlx::{
@@ -68,7 +69,7 @@ async fn the_pool_delivers_a_batch_concurrently(pool: PgPool) {
     let n = 20;
     seed(&store, &receiver, &format!("/slow?ms={SLOW_MS}"), n).await;
 
-    let pool = Pool::new(
+    let pool = Pool::with_config(
         store,
         PoolConfig {
             workers: n,
@@ -76,6 +77,7 @@ async fn the_pool_delivers_a_batch_concurrently(pool: PgPool) {
             idle_poll: Duration::from_millis(10),
             shutdown_deadline: Duration::from_secs(10),
         },
+        local(),
     );
 
     let started = Instant::now();
@@ -101,7 +103,7 @@ async fn in_flight_requests_never_exceed_the_worker_count(pool: PgPool) {
     let workers = 4;
     seed(&store, &receiver, &format!("/slow?ms={SLOW_MS}"), 20).await;
 
-    let pool = Arc::new(Pool::new(
+    let pool = Arc::new(Pool::with_config(
         store,
         PoolConfig {
             workers,
@@ -111,6 +113,7 @@ async fn in_flight_requests_never_exceed_the_worker_count(pool: PgPool) {
             idle_poll: Duration::from_millis(10),
             shutdown_deadline: Duration::from_secs(10),
         },
+        local(),
     ));
 
     // The continuous loop rather than `run_once`, because it claims again the moment
@@ -155,7 +158,7 @@ async fn a_hanging_endpoint_does_not_delay_healthy_ones(pool: PgPool) {
     let healthy = Receiver::new("whsec_pool_test");
     seed(&store, &healthy, "/verify", 5).await;
 
-    let pool = Arc::new(Pool::new(
+    let pool = Arc::new(Pool::with_config(
         store,
         PoolConfig {
             workers: 8,
@@ -169,6 +172,7 @@ async fn a_hanging_endpoint_does_not_delay_healthy_ones(pool: PgPool) {
             // the test down. Abandoning them is what the reaper is for.
             shutdown_deadline: Duration::from_millis(100),
         },
+        local(),
     ));
 
     let cancel = CancellationToken::new();
@@ -215,7 +219,7 @@ async fn no_database_connection_is_held_during_a_request(
     let receiver = Receiver::new("whsec_pool_test");
     seed(&store, &receiver, &format!("/slow?ms={SLOW_MS}"), 4).await;
 
-    let pool = Pool::new(
+    let pool = Pool::with_config(
         store,
         PoolConfig {
             workers: 4,
@@ -223,6 +227,7 @@ async fn no_database_connection_is_held_during_a_request(
             idle_poll: Duration::from_millis(10),
             shutdown_deadline: Duration::from_secs(10),
         },
+        local(),
     );
 
     let ran = tokio::time::timeout(Duration::from_secs(10), pool.run_once())
@@ -232,4 +237,16 @@ async fn no_database_connection_is_held_during_a_request(
 
     assert_eq!(ran, 4);
     assert_eq!(receiver.hits(), 4);
+}
+
+/// Every receiver in these tests runs on loopback, which the strict policy refuses.
+///
+/// Opted into explicitly rather than making permissive the default. A default that
+/// allows internal addresses is a vulnerability that ships whenever somebody forgets
+/// to configure it, and the tests are exactly where that forgetting would hide.
+fn local() -> SenderConfig {
+    SenderConfig {
+        policy: Policy::permissive(),
+        ..Default::default()
+    }
 }

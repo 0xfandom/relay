@@ -1271,6 +1271,7 @@ dependencies = [
  "axum",
  "hex",
  "rand",
+ "relay-domain",
  "relay-store",
  "serde",
  "serde_json",
@@ -1278,6 +1279,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
 ]
 

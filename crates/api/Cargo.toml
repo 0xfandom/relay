@@ -8,6 +8,7 @@ anyhow = "1.0.104"
 axum = "0.8.9"
 hex = "0.4.3"
 rand = "0.10.2"
+relay-domain = { version = "0.1.0", path = "../domain" }
 relay-store = { version = "0.1.0", path = "../store" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
@@ -15,4 +16,5 @@ thiserror = "2.0.19"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "net"] }
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
+url = "2.5.8"
 uuid = "1.24.0"
