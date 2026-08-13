@@ -28,6 +28,27 @@ pub struct Delivery {
     pub attempt: i32,
 }
 
+/// A parked delivery, joined with enough context to triage it.
+///
+/// The URL and event type are included because the first question about a dead
+/// letter is always "which endpoint, and what was it?" — and answering that from a
+/// bare delivery id means two more queries per row.
+#[derive(Debug, Clone, FromRow, Serialize)]
+pub struct DeadLetter {
+    pub delivery_id: Uuid,
+    pub endpoint_id: Uuid,
+    pub event_id: Uuid,
+    pub event_type: String,
+    pub url: String,
+    /// Attempts used in the current generation.
+    pub attempt: i32,
+    /// How many times this delivery has already been replayed.
+    pub generation: i32,
+    /// `permanent_failure` or `attempts_exhausted`.
+    pub dead_reason: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
 /// One row of the append-only attempt log.
 ///
 /// Everything needed to reconstruct what happened on a single try: what the endpoint
@@ -40,6 +61,9 @@ pub struct Attempt {
     pub latency_ms: i32,
     /// `success`, `deferred`, `retryable` or `permanent`.
     pub outcome_class: String,
+    /// Which replay run this attempt belonged to. Without it a replayed delivery
+    /// has two attempt 0s and the log cannot be read in order.
+    pub generation: i32,
     pub error: Option<String>,
     pub response_snippet: Option<String>,
     /// Which sender made the attempt. `None` only for rows predating the column.
