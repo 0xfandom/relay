@@ -23,7 +23,7 @@ use std::{
 
 use relay_domain::{
     backoff::Backoff,
-    outcome::{Class, Transport, classify_status, classify_transport},
+    outcome::{Class, Transport, classify_status, classify_transport, disposition},
 };
 use relay_store::{AttemptResult, PendingDelivery, Store};
 use tokio::{sync::Semaphore, task::JoinSet};
@@ -228,8 +228,7 @@ impl Sender {
                     .get(reqwest::header::RETRY_AFTER)
                     .and_then(|v| v.to_str().ok())
                     .and_then(relay_domain::backoff::parse_retry_after);
-                let body = resp.text().await.unwrap_or_default();
-                let snippet = truncate(&body, SNIPPET_BYTES);
+                let snippet = read_snippet(resp).await;
                 if class == Class::Success {
                     (
                         Outcome::Succeeded { status },
@@ -265,13 +264,16 @@ impl Sender {
             ),
         };
 
-        let (outcome_class, result) = match &outcome {
+        let (class, result) = match &outcome {
             Outcome::Succeeded { .. } => (Class::Success, AttemptResult::Succeeded),
             Outcome::Failed { class, .. } => {
                 (*class, self.next_step(*class, p.attempt, retry_after))
             }
         };
-        let outcome_class = outcome_class.as_str();
+
+        // Whether the endpoint asked us to wait is a property of this attempt rather
+        // than of the status code, so the classifier cannot know it on its own.
+        let recorded = disposition(class, retry_after.is_some());
 
         // Attempt row and final status commit together: an attempt without a status
         // describes a delivery that looks unfinished but has already been sent, and
@@ -283,9 +285,10 @@ impl Sender {
                 result,
                 http_status,
                 latency_ms,
-                outcome_class,
+                recorded.as_str(),
                 error.as_deref(),
                 snippet.as_deref(),
+                &self.worker_id,
             )
             .await?;
 
@@ -616,6 +619,26 @@ fn unix_now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .expect("system clock is after 1970")
         .as_secs() as i64
+}
+
+/// Read just enough of the response body to be useful in the log.
+///
+/// Streamed and stopped early rather than buffered and then truncated. A customer
+/// error page can be enormous, and `text()` would pull the whole thing into memory
+/// before anything trimmed it — with a pool of workers, a handful of endpoints
+/// returning multi-megabyte HTML is enough to matter. Stopping at the cap means the
+/// size of their error page is their problem, not ours.
+async fn read_snippet(mut resp: reqwest::Response) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    while buf.len() < SNIPPET_BYTES {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => buf.extend_from_slice(&chunk),
+            // A body that fails midway is not worth failing the attempt over: the
+            // status code has already told us what happened.
+            Ok(None) | Err(_) => break,
+        }
+    }
+    truncate(&String::from_utf8_lossy(&buf), SNIPPET_BYTES)
 }
 
 /// Truncate on a character boundary so the result is always valid UTF-8.
