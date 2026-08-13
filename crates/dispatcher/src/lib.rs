@@ -25,7 +25,7 @@ use relay_domain::{
     backoff::Backoff,
     outcome::{Class, Transport, classify_status, classify_transport, disposition},
 };
-use relay_store::{AttemptResult, PendingDelivery, Store};
+use relay_store::{AttemptResult, DeadReason, PendingDelivery, Store};
 use tokio::{sync::Semaphore, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -135,12 +135,20 @@ impl Sender {
         retry_after: Option<Duration>,
     ) -> AttemptResult {
         if class != Class::Retryable {
-            return AttemptResult::Dead;
+            return AttemptResult::Dead {
+                reason: DeadReason::PermanentFailure,
+            };
         }
 
         let attempt = attempt.max(0) as u32;
         if !self.backoff.attempts_remain(attempt) {
-            return AttemptResult::Dead;
+            // Distinguished from a permanent failure because the response is
+            // different: this one might well work now that the endpoint is back, and
+            // is worth replaying. A permanent failure needs someone to change
+            // something first.
+            return AttemptResult::Dead {
+                reason: DeadReason::AttemptsExhausted,
+            };
         }
 
         // The endpoint's own answer wins when it gave one — a rate limiter knows
