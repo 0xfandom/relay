@@ -1,17 +1,22 @@
 //! The sender.
 //!
-//! M1 keeps this deliberately dumb: one delivery at a time, no retries, no
-//! concurrency. Everything clever — the `SKIP LOCKED` claim, the worker pool, the
-//! reaper, backoff, breakers, rate limits — arrives in later milestones and is
-//! layered onto this shape.
+//! Two layers. [`Sender`] does one delivery: sign it, send it, record what happened.
+//! [`Pool`] runs many of those at once, claiming batches and bounding how many
+//! requests are in flight.
 //!
-//! Building the boring version first is not laziness. Once retries exist, a bug in
-//! signing looks exactly like a bug in retrying, and the only way to tell them
-//! apart is to have made the single-shot path boringly reliable beforehand.
+//! Still absent: retries, backoff, breakers, rate limits. Every failure here is
+//! terminal, which is wrong and is M3's job to fix. Building the boring version
+//! first is not laziness — once retries exist, a bug in signing looks exactly like
+//! a bug in retrying, and telling them apart depends on the single-shot path
+//! already being boringly reliable.
 
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 use relay_store::{DeliveryStatus, PendingDelivery, Store};
+use tokio::{sync::Semaphore, task::JoinSet};
 use uuid::Uuid;
 
 /// Customer error pages can be enormous. Store enough to debug with, no more.
@@ -35,11 +40,15 @@ pub enum Outcome {
     Failed { status: Option<u16>, error: String },
 }
 
+/// Cloning is cheap and shares state: `Store` clones share one connection pool and
+/// `reqwest::Client` clones share one connection pool too. The worker pool hands a
+/// clone to every spawned task, so this must not mean "open more sockets".
+#[derive(Clone)]
 pub struct Sender {
     store: Store,
     client: reqwest::Client,
-    /// Identifies which process holds a claim. Only informational today; M2's
-    /// reaper uses it to attribute stranded work.
+    /// Identifies which process holds a claim. The reaper uses it to attribute
+    /// stranded work.
     worker_id: String,
 }
 
@@ -87,7 +96,16 @@ impl Sender {
         if !self.store.claim(p.delivery_id, &self.worker_id).await? {
             return Ok(None);
         }
+        self.deliver_claimed(p).await.map(Some)
+    }
 
+    /// Send a delivery that has *already* been claimed, and record the outcome.
+    ///
+    /// Separate from [`Sender::deliver`] because the worker pool claims a whole
+    /// batch in one query and then fans the rows out. Calling this with an
+    /// unclaimed row would reintroduce the duplicate-send bug, so the only callers
+    /// are ones that have just claimed it.
+    pub async fn deliver_claimed(&self, p: PendingDelivery) -> Result<Outcome, SendError> {
         let timestamp = unix_now();
 
         // Sign the stored bytes, and send those same bytes. Nothing in between may
@@ -174,7 +192,144 @@ impl Sender {
             )
             .await?;
 
-        Ok(Some(outcome))
+        Ok(outcome)
+    }
+}
+
+/// How the pool is sized.
+#[derive(Debug, Clone)]
+pub struct PoolConfig {
+    /// Ceiling on requests in flight at once. The real limit on throughput, since a
+    /// worker spends essentially all of its time waiting on someone else's server.
+    pub workers: usize,
+    /// Rows per claim. Larger amortises the query over more deliveries; too large
+    /// and rows sit claimed — and so invisible to every other worker — while the
+    /// batch ahead of them drains.
+    pub batch_size: usize,
+    /// How long to wait before asking again once the queue comes back empty.
+    pub idle_poll: Duration,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self {
+            workers: 32,
+            batch_size: 32,
+            idle_poll: Duration::from_millis(250),
+        }
+    }
+}
+
+/// Claims batches of due deliveries and sends them concurrently.
+///
+/// The shape is one claim loop feeding many senders, rather than N independent
+/// loops each claiming for themselves. Both are correct — `SKIP LOCKED` makes
+/// concurrent claims safe either way — but one loop issues one query per batch
+/// instead of N queries per batch, and it can size each claim to the capacity that
+/// is actually free.
+pub struct Pool {
+    sender: Sender,
+    config: PoolConfig,
+    /// Permits are the in-flight bound. A task holds one for the whole request and
+    /// releases it on completion, so the claim loop can ask how much room is left
+    /// before deciding how many rows to take.
+    capacity: Arc<Semaphore>,
+}
+
+impl Pool {
+    pub fn new(store: Store, config: PoolConfig) -> Self {
+        Self {
+            sender: Sender::new(store),
+            capacity: Arc::new(Semaphore::new(config.workers)),
+            config,
+        }
+    }
+
+    /// Claim what there is room for and spawn a task per delivery.
+    ///
+    /// Returns the number claimed, or `None` when every worker is busy — the
+    /// caller must then wait for capacity rather than spinning on the database.
+    async fn claim_and_spawn(&self, tasks: &mut JoinSet<()>) -> Result<Option<usize>, SendError> {
+        // Reap finished tasks so the set does not grow without bound over the life
+        // of the process. Non-blocking: anything still running is left alone.
+        while tasks.try_join_next().is_some() {}
+
+        let free = self.capacity.available_permits();
+        if free == 0 {
+            return Ok(None);
+        }
+
+        // Never claim more than can start immediately. A claimed row is invisible to
+        // every other worker until it is finished or its lease expires, so claiming
+        // ahead of capacity strands work behind whatever is already running.
+        let want = free.min(self.config.batch_size);
+        let batch = self
+            .sender
+            .store
+            .claim_batch(want as i64, &self.sender.worker_id)
+            .await?;
+        let claimed = batch.len();
+
+        for pending in batch {
+            // Cannot block: `want` permits were free a moment ago and this is the
+            // only task that acquires them, so the count has only risen since.
+            let permit = self
+                .capacity
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("semaphore is never closed");
+            let sender = self.sender.clone();
+            tasks.spawn(async move {
+                let _permit = permit;
+                let id = pending.delivery_id;
+                match sender.deliver_claimed(pending).await {
+                    Ok(outcome) => tracing::info!(delivery_id = %id, ?outcome, "delivered"),
+                    // The row stays `inflight`, which is exactly right: it must not
+                    // be resent while the outcome is unknown. The reaper returns it
+                    // once the lease expires.
+                    Err(e) => tracing::error!(delivery_id = %id, error = %e, "delivery failed"),
+                }
+            });
+        }
+
+        Ok(Some(claimed))
+    }
+
+    /// Claim one batch and wait for all of it to finish.
+    ///
+    /// Deterministic, which makes it the right entry point for tests. [`Pool::run`]
+    /// is what production uses: it never waits for a batch to drain before claiming
+    /// the next, so one slow endpoint cannot hold up the rest.
+    pub async fn run_once(&self) -> Result<usize, SendError> {
+        let mut tasks = JoinSet::new();
+        let claimed = self.claim_and_spawn(&mut tasks).await?.unwrap_or(0);
+        while tasks.join_next().await.is_some() {}
+        Ok(claimed)
+    }
+
+    /// Drain the queue forever.
+    pub async fn run(&self) -> ! {
+        let mut tasks = JoinSet::new();
+        loop {
+            match self.claim_and_spawn(&mut tasks).await {
+                // Queue empty. Nothing to do but wait.
+                Ok(Some(0)) => tokio::time::sleep(self.config.idle_poll).await,
+                // Work started. Go straight back for more — deliveries already in
+                // flight keep running while the next batch is claimed, which is what
+                // stops a hanging endpoint from stalling healthy ones.
+                Ok(Some(_)) => {}
+                // Every worker busy. Park until one finishes instead of hammering
+                // the database with claims that can have nowhere to go.
+                Ok(None) => {
+                    let _ = self.capacity.acquire().await;
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "claim failed");
+                    tokio::time::sleep(self.config.idle_poll).await;
+                }
+            }
+        }
     }
 }
 
