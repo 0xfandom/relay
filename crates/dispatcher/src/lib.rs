@@ -21,6 +21,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use relay_domain::outcome::{Class, Transport, classify_status, classify_transport};
 use relay_store::{DeliveryStatus, PendingDelivery, Store};
 use tokio::{sync::Semaphore, task::JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -48,13 +49,38 @@ pub enum SendError {
 }
 
 /// What happened to one attempt.
-///
-/// M1 only distinguishes success from failure. M3 splits `Failed` into retryable
-/// and permanent, which is the point at which this becomes a real classifier.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    Succeeded { status: u16 },
-    Failed { status: Option<u16>, error: String },
+    Succeeded {
+        status: u16,
+    },
+    Failed {
+        /// Whether another attempt could plausibly succeed. Decided by
+        /// [`relay_domain::outcome`], never inline here — one rule, one place.
+        class: Class,
+        status: Option<u16>,
+        error: String,
+    },
+}
+
+/// Translate this HTTP client's error into something the domain can classify.
+///
+/// The domain deliberately knows nothing about `reqwest`, so the mapping lives on
+/// this side of the boundary. Everything unrecognised becomes `Other`, which is
+/// retryable — the safe default, since giving up on a transient failure loses a
+/// delivery while retrying a permanent one only wastes attempts.
+fn transport_of(e: &reqwest::Error) -> Transport {
+    if e.is_timeout() {
+        Transport::Timeout
+    } else if e.is_connect() {
+        Transport::Connect
+    } else if e.is_builder() {
+        // A URL that will not parse. Not a network problem and not fixable by
+        // waiting.
+        Transport::Invalid
+    } else {
+        Transport::Other
+    }
 }
 
 /// Cloning is cheap and shares state: `Store` clones share one connection pool and
@@ -152,25 +178,25 @@ impl Sender {
 
         let (outcome, http_status, error, snippet) = match result {
             Ok(resp) => {
-                let status = resp.status();
+                let status = resp.status().as_u16();
+                let class = classify_status(status);
                 let body = resp.text().await.unwrap_or_default();
                 let snippet = truncate(&body, SNIPPET_BYTES);
-                if status.is_success() {
+                if class == Class::Success {
                     (
-                        Outcome::Succeeded {
-                            status: status.as_u16(),
-                        },
-                        Some(status.as_u16() as i32),
+                        Outcome::Succeeded { status },
+                        Some(status as i32),
                         None,
                         Some(snippet),
                     )
                 } else {
                     (
                         Outcome::Failed {
-                            status: Some(status.as_u16()),
+                            class,
+                            status: Some(status),
                             error: format!("HTTP {status}"),
                         },
-                        Some(status.as_u16() as i32),
+                        Some(status as i32),
                         Some(format!("HTTP {status}")),
                         Some(snippet),
                     )
@@ -178,6 +204,7 @@ impl Sender {
             }
             Err(e) => (
                 Outcome::Failed {
+                    class: classify_transport(transport_of(&e)),
                     status: None,
                     error: e.to_string(),
                 },
@@ -188,10 +215,14 @@ impl Sender {
         };
 
         let (outcome_class, final_status) = match &outcome {
-            Outcome::Succeeded { .. } => ("success", DeliveryStatus::Succeeded),
-            // No retry policy yet, so every failure is terminal. M3 changes this.
-            Outcome::Failed { .. } => ("failed", DeliveryStatus::Dead),
+            Outcome::Succeeded { .. } => (Class::Success, DeliveryStatus::Succeeded),
+            // The class is recorded but not yet acted on: #11 is what turns a
+            // retryable failure into a rescheduled attempt. Until then every failure
+            // is still terminal, and the attempt log says which ones should not have
+            // been.
+            Outcome::Failed { class, .. } => (*class, DeliveryStatus::Dead),
         };
+        let outcome_class = outcome_class.as_str();
 
         // Attempt row and final status commit together: an attempt without a status
         // describes a delivery that looks unfinished but has already been sent, and
