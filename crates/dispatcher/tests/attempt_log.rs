@@ -10,8 +10,8 @@
 
 use std::time::Duration;
 
-use relay_dispatcher::{Pool, PoolConfig};
-use relay_domain::backoff::Backoff;
+use relay_dispatcher::{Pool, PoolConfig, SenderConfig};
+use relay_domain::{backoff::Backoff, url_guard::Policy};
 use relay_store::Store;
 use relay_testkit::Receiver;
 use sqlx::PgPool;
@@ -72,7 +72,14 @@ async fn the_full_history_is_reconstructable_from_the_log_alone(pool: PgPool) {
     let id = endpoint(&store, &receiver, "/always500").await;
 
     let max_attempts = 4;
-    let sender = Pool::with_backoff(store.clone(), pool_config(), fast_backoff(max_attempts));
+    let sender = Pool::with_config(
+        store.clone(),
+        pool_config(),
+        SenderConfig {
+            backoff: fast_backoff(max_attempts),
+            ..local()
+        },
+    );
     assert_eq!(drain(&sender, &store, id).await, "dead");
 
     let history = store.attempt_history(id).await.unwrap();
@@ -117,7 +124,14 @@ async fn a_deferral_is_distinguishable_from_a_failure(pool: PgPool) {
     let broken = Receiver::new("whsec_log_test");
     let broken_id = endpoint(&store, &broken, "/always500").await;
 
-    let sender = Pool::with_backoff(store.clone(), pool_config(), fast_backoff(12));
+    let sender = Pool::with_config(
+        store.clone(),
+        pool_config(),
+        SenderConfig {
+            backoff: fast_backoff(12),
+            ..local()
+        },
+    );
     assert_eq!(sender.run_once().await.expect("run"), 2);
 
     // Both are retryable and both came back. But one endpoint is working correctly
@@ -144,7 +158,14 @@ async fn a_success_and_a_permanent_failure_are_recorded_as_such(pool: PgPool) {
     let gone = Receiver::new("whsec_log_test");
     let gone_id = endpoint(&store, &gone, "/no-such-route").await;
 
-    let sender = Pool::with_backoff(store.clone(), pool_config(), fast_backoff(12));
+    let sender = Pool::with_config(
+        store.clone(),
+        pool_config(),
+        SenderConfig {
+            backoff: fast_backoff(12),
+            ..local()
+        },
+    );
     assert_eq!(sender.run_once().await.expect("run"), 2);
 
     let ok_attempt = &store.attempt_history(ok_id).await.unwrap()[0];
@@ -166,7 +187,14 @@ async fn an_enormous_response_body_does_not_produce_an_enormous_row(pool: PgPool
     // Four megabytes of error page. Framework debug pages really are this size.
     let id = endpoint(&store, &receiver, "/bigbody?kb=4096").await;
 
-    let sender = Pool::with_backoff(store.clone(), pool_config(), fast_backoff(1));
+    let sender = Pool::with_config(
+        store.clone(),
+        pool_config(),
+        SenderConfig {
+            backoff: fast_backoff(1),
+            ..local()
+        },
+    );
     assert_eq!(sender.run_once().await.expect("run"), 1);
 
     let snippet = store.attempt_history(id).await.unwrap()[0]
@@ -188,7 +216,14 @@ async fn an_attempt_row_cannot_be_rewritten(pool: PgPool) {
     let receiver = Receiver::new("whsec_log_test");
     let id = endpoint(&store, &receiver, "/verify").await;
 
-    let sender = Pool::with_backoff(store.clone(), pool_config(), fast_backoff(1));
+    let sender = Pool::with_config(
+        store.clone(),
+        pool_config(),
+        SenderConfig {
+            backoff: fast_backoff(1),
+            ..local()
+        },
+    );
     assert_eq!(sender.run_once().await.expect("run"), 1);
 
     // Enforced by the database, not by convention. An attempt that can be edited
@@ -213,7 +248,14 @@ async fn an_unknown_outcome_class_is_rejected_by_the_database(pool: PgPool) {
     let receiver = Receiver::new("whsec_log_test");
     let id = endpoint(&store, &receiver, "/verify").await;
 
-    let sender = Pool::with_backoff(store.clone(), pool_config(), fast_backoff(1));
+    let sender = Pool::with_config(
+        store.clone(),
+        pool_config(),
+        SenderConfig {
+            backoff: fast_backoff(1),
+            ..local()
+        },
+    );
     sender.run_once().await.expect("run");
 
     // A typo in this column should be a failed write, not a row that quietly breaks
@@ -227,4 +269,16 @@ async fn an_unknown_outcome_class_is_rejected_by_the_database(pool: PgPool) {
     .await;
 
     assert!(bad.is_err(), "a misspelled outcome class was accepted");
+}
+
+/// Every receiver in these tests runs on loopback, which the strict policy refuses.
+///
+/// Opted into explicitly rather than making permissive the default. A default that
+/// allows internal addresses is a vulnerability that ships whenever somebody forgets
+/// to configure it, and the tests are exactly where that forgetting would hide.
+fn local() -> SenderConfig {
+    SenderConfig {
+        policy: Policy::permissive(),
+        ..Default::default()
+    }
 }

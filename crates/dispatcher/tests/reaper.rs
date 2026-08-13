@@ -14,7 +14,8 @@
 
 use std::time::Duration;
 
-use relay_dispatcher::{Pool, PoolConfig, REQUEST_TIMEOUT, Reaper, ReaperConfig};
+use relay_dispatcher::{Pool, PoolConfig, REQUEST_TIMEOUT, Reaper, ReaperConfig, SenderConfig};
+use relay_domain::url_guard::Policy;
 use relay_store::Store;
 use relay_testkit::Receiver;
 use sqlx::PgPool;
@@ -157,7 +158,10 @@ async fn a_finished_delivery_is_never_reaped(pool: PgPool) {
         shutdown_deadline: Duration::from_secs(5),
     };
     assert_eq!(
-        Pool::new(store.clone(), pool_cfg).run_once().await.unwrap(),
+        Pool::with_config(store.clone(), pool_cfg, local())
+            .run_once()
+            .await
+            .unwrap(),
         1
     );
 
@@ -204,7 +208,7 @@ async fn a_delivery_stranded_by_a_dead_worker_is_eventually_delivered(pool: PgPo
         idle_poll: Duration::from_millis(10),
         shutdown_deadline: Duration::from_secs(5),
     };
-    let sender = Pool::new(store.clone(), pool_cfg);
+    let sender = Pool::with_config(store.clone(), pool_cfg, local());
     assert_eq!(sender.run_once().await.unwrap(), 0);
     assert_eq!(receiver.hits(), 0);
 
@@ -228,6 +232,7 @@ async fn a_delivery_stranded_by_a_dead_worker_is_eventually_delivered(pool: PgPo
 
 // Async only because the lazy pool wants a Tokio context to exist; nothing here
 // touches the database.
+
 #[tokio::test]
 async fn a_lease_shorter_than_the_request_timeout_is_rejected() {
     // Not a warning. A lease that can expire mid-request makes the reaper a source
@@ -251,4 +256,16 @@ async fn a_lease_shorter_than_the_request_timeout_is_rejected() {
 /// A store that is never queried — the config check happens before any I/O.
 fn dummy_store() -> Store {
     Store::from_pool(PgPool::connect_lazy("postgres://unused/unused").expect("lazy pool"))
+}
+
+/// Every receiver in these tests runs on loopback, which the strict policy refuses.
+///
+/// Opted into explicitly rather than making permissive the default. A default that
+/// allows internal addresses is a vulnerability that ships whenever somebody forgets
+/// to configure it, and the tests are exactly where that forgetting would hide.
+fn local() -> SenderConfig {
+    SenderConfig {
+        policy: Policy::permissive(),
+        ..Default::default()
+    }
 }

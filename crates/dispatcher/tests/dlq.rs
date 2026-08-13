@@ -13,8 +13,8 @@
 use std::{net::SocketAddr, time::Duration};
 
 use relay_api::{AppState, router};
-use relay_dispatcher::{Pool, PoolConfig};
-use relay_domain::backoff::Backoff;
+use relay_dispatcher::{Pool, PoolConfig, SenderConfig};
+use relay_domain::{backoff::Backoff, url_guard::Policy};
 use relay_store::Store;
 use relay_testkit::Receiver;
 use sqlx::PgPool;
@@ -100,7 +100,14 @@ async fn a_permanent_failure_is_parked_on_the_first_attempt_with_a_reason(pool: 
     seed(&store, &receiver, "/no-such-route", 1).await;
     let api = spawn_api(store.clone()).await;
 
-    let sender = Pool::with_backoff(store.clone(), pool_config(), fast_backoff(12));
+    let sender = Pool::with_config(
+        store.clone(),
+        pool_config(),
+        SenderConfig {
+            backoff: fast_backoff(12),
+            ..local()
+        },
+    );
     assert_eq!(sender.run_once().await.expect("run"), 1);
 
     let body = get_json(&format!("http://{api}/v1/dlq")).await;
@@ -126,7 +133,14 @@ async fn exhaustion_and_permanent_failure_are_recorded_differently(pool: PgPool)
     seed(&store, &gone, "/no-such-route", 1).await;
 
     let api = spawn_api(store.clone()).await;
-    let sender = Pool::with_backoff(store.clone(), pool_config(), fast_backoff(3));
+    let sender = Pool::with_config(
+        store.clone(),
+        pool_config(),
+        SenderConfig {
+            backoff: fast_backoff(3),
+            ..local()
+        },
+    );
     drain_all(&sender).await;
 
     // The two need different responses. One needs someone to fix a URL; the other
@@ -151,7 +165,14 @@ async fn a_replayed_delivery_is_attempted_again_and_can_succeed(pool: PgPool) {
     let (_, _) = seed(&store, &receiver, "/flaky?pct=3", 1).await;
     let api = spawn_api(store.clone()).await;
 
-    let sender = Pool::with_backoff(store.clone(), pool_config(), fast_backoff(2));
+    let sender = Pool::with_config(
+        store.clone(),
+        pool_config(),
+        SenderConfig {
+            backoff: fast_backoff(2),
+            ..local()
+        },
+    );
     drain_all(&sender).await;
 
     let listed = get_json(&format!("http://{api}/v1/dlq")).await;
@@ -194,7 +215,14 @@ async fn a_replay_keeps_the_earlier_attempts_but_starts_a_new_generation(pool: P
     seed(&store, &receiver, "/always500", 1).await;
     let api = spawn_api(store.clone()).await;
 
-    let sender = Pool::with_backoff(store.clone(), pool_config(), fast_backoff(2));
+    let sender = Pool::with_config(
+        store.clone(),
+        pool_config(),
+        SenderConfig {
+            backoff: fast_backoff(2),
+            ..local()
+        },
+    );
     drain_all(&sender).await;
 
     let listed = get_json(&format!("http://{api}/v1/dlq")).await;
@@ -231,7 +259,14 @@ async fn bulk_replay_is_filtered_and_bounded(pool: PgPool) {
     seed(&store, &gone, "/no-such-route", 3).await;
 
     let api = spawn_api(store.clone()).await;
-    let sender = Pool::with_backoff(store.clone(), pool_config(), fast_backoff(2));
+    let sender = Pool::with_config(
+        store.clone(),
+        pool_config(),
+        SenderConfig {
+            backoff: fast_backoff(2),
+            ..local()
+        },
+    );
     drain_all(&sender).await;
     assert_eq!(get_json(&format!("http://{api}/v1/dlq")).await["count"], 9);
 
@@ -262,7 +297,14 @@ async fn replaying_something_that_is_not_dead_is_refused(pool: PgPool) {
     seed(&store, &receiver, "/verify", 1).await;
     let api = spawn_api(store.clone()).await;
 
-    let sender = Pool::with_backoff(store.clone(), pool_config(), fast_backoff(12));
+    let sender = Pool::with_config(
+        store.clone(),
+        pool_config(),
+        SenderConfig {
+            backoff: fast_backoff(12),
+            ..local()
+        },
+    );
     assert_eq!(sender.run_once().await.expect("run"), 1);
 
     // The delivery succeeded, so it is not in the queue at all.
@@ -307,4 +349,16 @@ async fn an_unknown_reason_filter_is_rejected(pool: PgPool) {
         400,
         "a typo in a filter must be an error, not a silently empty listing"
     );
+}
+
+/// Every receiver in these tests runs on loopback, which the strict policy refuses.
+///
+/// Opted into explicitly rather than making permissive the default. A default that
+/// allows internal addresses is a vulnerability that ships whenever somebody forgets
+/// to configure it, and the tests are exactly where that forgetting would hide.
+fn local() -> SenderConfig {
+    SenderConfig {
+        policy: Policy::permissive(),
+        ..Default::default()
+    }
 }
