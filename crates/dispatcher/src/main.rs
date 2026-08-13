@@ -2,6 +2,7 @@ use std::{sync::Arc, time::Duration};
 
 use relay_dispatcher::{Pool, PoolConfig, REQUEST_TIMEOUT, Reaper, ReaperConfig};
 use relay_store::Store;
+use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -14,6 +15,9 @@ async fn main() -> anyhow::Result<()> {
         workers: env_usize("RELAY_WORKERS", 32)?,
         batch_size: env_usize("RELAY_BATCH_SIZE", 32)?,
         idle_poll: Duration::from_millis(env_usize("RELAY_IDLE_POLL_MS", 250)? as u64),
+        shutdown_deadline: Duration::from_secs(
+            env_usize("RELAY_SHUTDOWN_DEADLINE_SECS", 15)? as u64
+        ),
     };
 
     // Connections are held only for the claim and for recording the outcome, never
@@ -39,12 +43,65 @@ async fn main() -> anyhow::Result<()> {
         db_connections,
         lease_ttl = ?reaper_config.lease_ttl,
         request_timeout = ?REQUEST_TIMEOUT,
+        shutdown_deadline = ?config.shutdown_deadline,
         "relay-dispatcher started"
     );
 
-    tokio::spawn(async move { reaper.run().await });
+    // One token, every loop. A shutdown that stopped some loops and not others would
+    // leave the reaper rescuing work that the pool is no longer around to send.
+    let cancel = CancellationToken::new();
 
-    Pool::new(store, config).run().await
+    let signalled = cancel.clone();
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        tracing::info!("shutdown signal received");
+        signalled.cancel();
+    });
+
+    let reaper_loop = {
+        let cancel = cancel.clone();
+        tokio::spawn(async move { reaper.run(cancel).await })
+    };
+
+    // Returns once cancelled and everything in flight has finished or hit the
+    // deadline.
+    Pool::new(store, config).run(cancel).await;
+    let _ = reaper_loop.await;
+
+    tracing::info!("relay-dispatcher stopped");
+    Ok(())
+}
+
+/// Resolves on SIGTERM or Ctrl-C.
+///
+/// SIGTERM is the one that matters: it is what container runtimes send before
+/// SIGKILL, so handling it is the difference between draining in-flight deliveries
+/// and having them cut off on every deploy.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "cannot listen for SIGTERM");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
 }
 
 fn env_usize(key: &str, default: usize) -> anyhow::Result<usize> {
