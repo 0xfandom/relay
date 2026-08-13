@@ -4,6 +4,9 @@
 //! [`Pool`] runs many of those at once, claiming batches and bounding how many
 //! requests are in flight.
 //!
+//! [`Reaper`] is the third piece and runs alongside them: workers die holding work,
+//! and something has to notice.
+//!
 //! Still absent: retries, backoff, breakers, rate limits. Every failure here is
 //! terminal, which is wrong and is M3's job to fix. Building the boring version
 //! first is not laziness — once retries exist, a bug in signing looks exactly like
@@ -11,7 +14,10 @@
 //! already being boringly reliable.
 
 use std::{
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -21,6 +27,16 @@ use uuid::Uuid;
 
 /// Customer error pages can be enormous. Store enough to debug with, no more.
 const SNIPPET_BYTES: usize = 2048;
+
+/// Ceiling on one outbound request, connect included.
+///
+/// Public because the reaper's lease has to outlast it. If a lease could expire
+/// while a request were still running, the reaper would return the row to the queue
+/// and a second worker would send it while the first was still waiting on a reply.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Time to establish a connection, inside [`REQUEST_TIMEOUT`].
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, thiserror::Error)]
 pub enum SendError {
@@ -58,8 +74,8 @@ impl Sender {
             // Three separate limits. A missing *total* timeout is the classic way a
             // worker pool dies: a per-read timeout resets on every byte, so a slow
             // trickle can hold a connection open indefinitely.
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(10))
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("reqwest client builds with static configuration");
@@ -329,6 +345,99 @@ impl Pool {
                     tokio::time::sleep(self.config.idle_poll).await;
                 }
             }
+        }
+    }
+}
+
+/// How often the reaper looks, and how long a lease lasts.
+#[derive(Debug, Clone)]
+pub struct ReaperConfig {
+    /// How long a worker may hold a delivery before it is presumed dead.
+    pub lease_ttl: Duration,
+    /// How often to look. Sets the worst-case delay before a stranded delivery is
+    /// rescued, so the real recovery time is `lease_ttl + interval`.
+    pub interval: Duration,
+}
+
+impl Default for ReaperConfig {
+    fn default() -> Self {
+        Self {
+            // Three times the request timeout. Generous on purpose: rescuing early
+            // sends a webhook twice, rescuing late delays it. The second is much
+            // cheaper to be wrong about.
+            lease_ttl: REQUEST_TIMEOUT * 3,
+            interval: Duration::from_secs(10),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "lease TTL {lease_ttl:?} must be longer than the request timeout {REQUEST_TIMEOUT:?}: \
+     a lease that expires mid-request lets a second worker send the same delivery"
+)]
+pub struct LeaseTooShort {
+    pub lease_ttl: Duration,
+}
+
+/// Returns deliveries stranded by dead workers to the queue.
+///
+/// The pool marks a row `inflight` before sending and only writes a final status
+/// once the outcome is known. That is the correct order — it is what stops a
+/// delivery being sent twice — but it means a worker that dies in between leaves a
+/// row nobody owns and the claim query cannot see. This loop is what unsticks them.
+pub struct Reaper {
+    store: Store,
+    config: ReaperConfig,
+    rescued: AtomicU64,
+}
+
+impl Reaper {
+    /// Fails if the lease could expire while a request is still in flight, which
+    /// would turn the reaper from a safety net into a source of duplicates.
+    pub fn new(store: Store, config: ReaperConfig) -> Result<Self, LeaseTooShort> {
+        if config.lease_ttl <= REQUEST_TIMEOUT {
+            return Err(LeaseTooShort {
+                lease_ttl: config.lease_ttl,
+            });
+        }
+        Ok(Self {
+            store,
+            config,
+            rescued: AtomicU64::new(0),
+        })
+    }
+
+    /// Deliveries rescued since start. Should stay at zero; a rising count means
+    /// workers are dying.
+    pub fn rescued(&self) -> u64 {
+        self.rescued.load(Ordering::Relaxed)
+    }
+
+    pub async fn reap_once(&self) -> Result<u64, SendError> {
+        let n = self
+            .store
+            .reap_expired_leases(self.config.lease_ttl)
+            .await?;
+        if n > 0 {
+            self.rescued.fetch_add(n, Ordering::Relaxed);
+            // Warn, not info. Zero is the normal value, so any of this is a report
+            // that something upstream died.
+            tracing::warn!(
+                rescued = n,
+                lease_ttl = ?self.config.lease_ttl,
+                "returned stranded deliveries to the queue"
+            );
+        }
+        Ok(n)
+    }
+
+    pub async fn run(&self) -> ! {
+        loop {
+            if let Err(e) = self.reap_once().await {
+                tracing::error!(error = %e, "reaper failed");
+            }
+            tokio::time::sleep(self.config.interval).await;
         }
     }
 }
