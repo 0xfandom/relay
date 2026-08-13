@@ -154,6 +154,7 @@ async fn a_finished_delivery_is_never_reaped(pool: PgPool) {
         workers: 1,
         batch_size: 1,
         idle_poll: Duration::from_millis(10),
+        shutdown_deadline: Duration::from_secs(5),
     };
     assert_eq!(
         Pool::new(store.clone(), pool_cfg).run_once().await.unwrap(),
@@ -201,6 +202,7 @@ async fn a_delivery_stranded_by_a_dead_worker_is_eventually_delivered(pool: PgPo
         workers: 4,
         batch_size: 4,
         idle_poll: Duration::from_millis(10),
+        shutdown_deadline: Duration::from_secs(5),
     };
     let sender = Pool::new(store.clone(), pool_cfg);
     assert_eq!(sender.run_once().await.unwrap(), 0);

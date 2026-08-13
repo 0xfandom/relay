@@ -22,6 +22,7 @@ use sqlx::{
     postgres::{PgConnectOptions, PgPoolOptions},
 };
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 /// How long a `/slow` receiver takes to answer. Long enough that serial execution
 /// is unmistakably slower than concurrent, short enough to keep the suite quick.
@@ -73,6 +74,7 @@ async fn the_pool_delivers_a_batch_concurrently(pool: PgPool) {
             workers: n,
             batch_size: n,
             idle_poll: Duration::from_millis(10),
+            shutdown_deadline: Duration::from_secs(10),
         },
     );
 
@@ -107,22 +109,26 @@ async fn in_flight_requests_never_exceed_the_worker_count(pool: PgPool) {
             // permits, not from the batch size happening to match.
             batch_size: 50,
             idle_poll: Duration::from_millis(10),
+            shutdown_deadline: Duration::from_secs(10),
         },
     ));
 
     // The continuous loop rather than `run_once`, because it claims again the moment
     // a permit frees. That is when a bound is most likely to be exceeded — a pool
     // that only respects its limit within a single batch fails here.
+    let cancel = CancellationToken::new();
     let running = pool.clone();
-    let handle = tokio::spawn(async move {
-        running.run().await;
+    let handle = tokio::spawn({
+        let cancel = cancel.clone();
+        async move { running.run(cancel).await }
     });
 
     wait_until(Duration::from_secs(15), "all 20 deliveries", || {
         receiver.hits() == 20
     })
     .await;
-    handle.abort();
+    cancel.cancel();
+    handle.await.expect("pool loop");
 
     assert!(
         receiver.max_in_flight() <= workers as u64,
@@ -158,12 +164,18 @@ async fn a_hanging_endpoint_does_not_delay_healthy_ones(pool: PgPool) {
             // two are still outstanding.
             batch_size: 2,
             idle_poll: Duration::from_millis(10),
+            // Short, because the two hanging deliveries will still be outstanding at
+            // shutdown and waiting the full request timeout for them would only slow
+            // the test down. Abandoning them is what the reaper is for.
+            shutdown_deadline: Duration::from_millis(100),
         },
     ));
 
+    let cancel = CancellationToken::new();
     let running = pool.clone();
-    let handle = tokio::spawn(async move {
-        running.run().await;
+    let handle = tokio::spawn({
+        let cancel = cancel.clone();
+        async move { running.run(cancel).await }
     });
 
     wait_until(Duration::from_secs(5), "all healthy deliveries", || {
@@ -178,7 +190,8 @@ async fn a_hanging_endpoint_does_not_delay_healthy_ones(pool: PgPool) {
         "the hanging endpoint should have been contacted and still be unfinished"
     );
 
-    handle.abort();
+    cancel.cancel();
+    handle.await.expect("pool loop");
 }
 
 #[sqlx::test(migrations = "../store/migrations")]
@@ -208,6 +221,7 @@ async fn no_database_connection_is_held_during_a_request(
             workers: 4,
             batch_size: 4,
             idle_poll: Duration::from_millis(10),
+            shutdown_deadline: Duration::from_secs(10),
         },
     );
 
