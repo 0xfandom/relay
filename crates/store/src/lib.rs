@@ -348,7 +348,8 @@ impl Store {
 
     pub async fn get_delivery(&self, id: Uuid) -> Result<Option<Delivery>> {
         let d = sqlx::query_as::<_, Delivery>(
-            "SELECT id, event_id, endpoint_id, status, attempt FROM deliveries WHERE id = $1",
+            "SELECT id, event_id, endpoint_id, status, attempt, dead_reason, generation
+             FROM deliveries WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
