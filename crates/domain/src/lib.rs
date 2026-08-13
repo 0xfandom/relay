@@ -8,5 +8,6 @@
 //! ever find yourself wanting `sqlx` or `tokio` in here, the code belongs in a
 //! different crate.
 
+pub mod backoff;
 pub mod outcome;
 pub mod signature;
