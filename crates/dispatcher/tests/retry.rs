@@ -10,8 +10,8 @@
 
 use std::time::Duration;
 
-use relay_dispatcher::{Pool, PoolConfig};
-use relay_domain::backoff::Backoff;
+use relay_dispatcher::{Pool, PoolConfig, SenderConfig};
+use relay_domain::{backoff::Backoff, url_guard::Policy};
 use relay_store::Store;
 use relay_testkit::Receiver;
 use sqlx::PgPool;
@@ -73,7 +73,14 @@ async fn a_retryable_failure_goes_back_to_pending_rather_than_dead(pool: PgPool)
     let receiver = Receiver::new("whsec_retry_test");
     let id = endpoint(&store, &receiver, "/always500").await;
 
-    let sender = Pool::with_backoff(store.clone(), pool_config(), fast_backoff(5));
+    let sender = Pool::with_config(
+        store.clone(),
+        pool_config(),
+        SenderConfig {
+            backoff: fast_backoff(5),
+            ..local()
+        },
+    );
     assert_eq!(sender.run_once().await.expect("run"), 1);
 
     let d = store.get_delivery(id).await.unwrap().unwrap();
@@ -98,7 +105,14 @@ async fn a_rescheduled_delivery_is_not_claimable_until_its_delay_has_passed(pool
         max_attempts: 5,
         retry_after_cap: Duration::from_secs(300),
     };
-    let sender = Pool::with_backoff(store.clone(), pool_config(), slow);
+    let sender = Pool::with_config(
+        store.clone(),
+        pool_config(),
+        SenderConfig {
+            backoff: slow,
+            ..local()
+        },
+    );
     assert_eq!(sender.run_once().await.expect("run"), 1);
 
     // `pending` alone is not enough: without `next_attempt_at` moving into the
@@ -123,7 +137,14 @@ async fn a_permanent_failure_dies_on_the_first_attempt(pool: PgPool) {
     // No route at this path, so the receiver answers 404.
     let id = endpoint(&store, &receiver, "/no-such-route").await;
 
-    let sender = Pool::with_backoff(store.clone(), pool_config(), fast_backoff(12));
+    let sender = Pool::with_config(
+        store.clone(),
+        pool_config(),
+        SenderConfig {
+            backoff: fast_backoff(12),
+            ..local()
+        },
+    );
     assert_eq!(sender.run_once().await.expect("run"), 1);
 
     let d = store.get_delivery(id).await.unwrap().unwrap();
@@ -142,7 +163,14 @@ async fn a_delivery_runs_out_of_attempts_and_dies(pool: PgPool) {
     let id = endpoint(&store, &receiver, "/always500").await;
 
     let max_attempts = 4;
-    let sender = Pool::with_backoff(store.clone(), pool_config(), fast_backoff(max_attempts));
+    let sender = Pool::with_config(
+        store.clone(),
+        pool_config(),
+        SenderConfig {
+            backoff: fast_backoff(max_attempts),
+            ..local()
+        },
+    );
 
     assert_eq!(run_until_settled(&sender, &store, id).await, "dead");
 
@@ -168,7 +196,14 @@ async fn a_delivery_that_recovers_succeeds_without_using_every_attempt(pool: PgP
     // rather than random, so this is the same run every time.
     let id = endpoint(&store, &receiver, "/flaky?pct=3").await;
 
-    let sender = Pool::with_backoff(store.clone(), pool_config(), fast_backoff(12));
+    let sender = Pool::with_config(
+        store.clone(),
+        pool_config(),
+        SenderConfig {
+            backoff: fast_backoff(12),
+            ..local()
+        },
+    );
     assert_eq!(run_until_settled(&sender, &store, id).await, "succeeded");
 
     let d = store.get_delivery(id).await.unwrap().unwrap();
@@ -188,7 +223,14 @@ async fn retry_after_overrides_the_computed_backoff(pool: PgPool) {
 
     // A backoff so short that without honouring the header the delivery would be
     // claimable again almost immediately.
-    let sender = Pool::with_backoff(store.clone(), pool_config(), fast_backoff(12));
+    let sender = Pool::with_config(
+        store.clone(),
+        pool_config(),
+        SenderConfig {
+            backoff: fast_backoff(12),
+            ..local()
+        },
+    );
     assert_eq!(sender.run_once().await.expect("run"), 1);
 
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -207,7 +249,14 @@ async fn every_attempt_of_a_retried_delivery_reuses_one_delivery_id(pool: PgPool
     let receiver = Receiver::new("whsec_retry_test");
     let id = endpoint(&store, &receiver, "/always500").await;
 
-    let sender = Pool::with_backoff(store.clone(), pool_config(), fast_backoff(3));
+    let sender = Pool::with_config(
+        store.clone(),
+        pool_config(),
+        SenderConfig {
+            backoff: fast_backoff(3),
+            ..local()
+        },
+    );
     assert_eq!(run_until_settled(&sender, &store, id).await, "dead");
 
     let seen = receiver.received_ids();
@@ -217,4 +266,16 @@ async fn every_attempt_of_a_retried_delivery_reuses_one_delivery_id(pool: PgPool
         "retries must reuse the delivery id, or the receiver cannot tell a retry \
          from a new event and deduplication becomes impossible: {seen:?}"
     );
+}
+
+/// Every receiver in these tests runs on loopback, which the strict policy refuses.
+///
+/// Opted into explicitly rather than making permissive the default. A default that
+/// allows internal addresses is a vulnerability that ships whenever somebody forgets
+/// to configure it, and the tests are exactly where that forgetting would hide.
+fn local() -> SenderConfig {
+    SenderConfig {
+        policy: Policy::permissive(),
+        ..Default::default()
+    }
 }

@@ -16,7 +16,8 @@
 use std::net::SocketAddr;
 
 use relay_api::{AppState, router};
-use relay_dispatcher::{Outcome, Sender};
+use relay_dispatcher::{Outcome, Sender, SenderConfig};
+use relay_domain::url_guard::Policy;
 use relay_store::Store;
 use relay_testkit::Receiver;
 use uuid::Uuid;
@@ -114,7 +115,7 @@ async fn signed_delivery_is_verified_by_the_receiver() {
     let deliveries = ingest(f.api, &f.event_type, body).await;
     assert_eq!(deliveries.len(), 1, "one subscribed endpoint, one delivery");
 
-    let sender = Sender::new(f.store.clone());
+    let sender = Sender::with_config(f.store.clone(), local());
     let outcome = sender.deliver_by_id(deliveries[0]).await.unwrap().unwrap();
 
     assert_eq!(outcome, Outcome::Succeeded { status: 200 });
@@ -137,7 +138,7 @@ async fn a_wrong_secret_is_rejected_by_the_receiver() {
     let f = fixture("/verify", "whsec_relay_side", "whsec_receiver_side").await;
 
     let deliveries = ingest(f.api, &f.event_type, r#"{"type":"order.paid"}"#).await;
-    let sender = Sender::new(f.store.clone());
+    let sender = Sender::with_config(f.store.clone(), local());
     let outcome = sender.deliver_by_id(deliveries[0]).await.unwrap().unwrap();
 
     match outcome {
@@ -159,7 +160,7 @@ async fn payload_bytes_are_stored_and_sent_verbatim() {
     let body = r#"{"zebra":1,  "apple":2,"nested":{"b":1,"a":2}}"#;
 
     let deliveries = ingest(f.api, &f.event_type, body).await;
-    let sender = Sender::new(f.store.clone());
+    let sender = Sender::with_config(f.store.clone(), local());
     let outcome = sender.deliver_by_id(deliveries[0]).await.unwrap().unwrap();
 
     assert_eq!(
@@ -253,7 +254,7 @@ async fn a_delivery_is_never_sent_twice_by_the_same_loop() {
     // Claiming first makes the second pass find nothing to do.
     let f = fixture("/verify", "whsec_once", "whsec_once").await;
     let deliveries = ingest(f.api, &f.event_type, r#"{"type":"order.paid"}"#).await;
-    let sender = Sender::new(f.store.clone());
+    let sender = Sender::with_config(f.store.clone(), local());
 
     let first = sender.deliver_by_id(deliveries[0]).await.unwrap();
     assert_eq!(first, Some(Outcome::Succeeded { status: 200 }));
@@ -268,4 +269,16 @@ async fn a_delivery_is_never_sent_twice_by_the_same_loop() {
         "the endpoint must be contacted exactly once"
     );
     assert_eq!(f.store.attempts_for(deliveries[0]).await.unwrap(), 1);
+}
+
+/// Every receiver in these tests runs on loopback, which the strict policy refuses.
+///
+/// Opted into explicitly rather than making permissive the default. A default that
+/// allows internal addresses is a vulnerability that ships whenever somebody forgets
+/// to configure it, and the tests are exactly where that forgetting would hide.
+fn local() -> SenderConfig {
+    SenderConfig {
+        policy: Policy::permissive(),
+        ..Default::default()
+    }
 }

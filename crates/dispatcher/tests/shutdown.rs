@@ -14,7 +14,8 @@
 
 use std::{sync::Arc, time::Duration};
 
-use relay_dispatcher::{Pool, PoolConfig, Reaper, ReaperConfig};
+use relay_dispatcher::{Pool, PoolConfig, Reaper, ReaperConfig, SenderConfig};
+use relay_domain::url_guard::Policy;
 use relay_store::Store;
 use relay_testkit::Receiver;
 use sqlx::PgPool;
@@ -75,7 +76,11 @@ async fn a_clean_shutdown_leaves_nothing_inflight(pool: PgPool) {
     let receiver = Receiver::new("whsec_shutdown_test");
     seed(&store, &receiver, "/verify?ms=0", 8).await;
 
-    let pool = Arc::new(Pool::new(store.clone(), config(Duration::from_secs(10))));
+    let pool = Arc::new(Pool::with_config(
+        store.clone(),
+        config(Duration::from_secs(10)),
+        local(),
+    ));
     let cancel = CancellationToken::new();
     let handle = tokio::spawn({
         let (pool, cancel) = (pool.clone(), cancel.clone());
@@ -108,7 +113,11 @@ async fn in_flight_deliveries_finish_rather_than_being_cut_off(pool: PgPool) {
     // Slow enough that cancellation lands squarely in the middle of every request.
     seed(&store, &receiver, "/slow?ms=600", 4).await;
 
-    let pool = Arc::new(Pool::new(store.clone(), config(Duration::from_secs(10))));
+    let pool = Arc::new(Pool::with_config(
+        store.clone(),
+        config(Duration::from_secs(10)),
+        local(),
+    ));
     let cancel = CancellationToken::new();
     let handle = tokio::spawn({
         let (pool, cancel) = (pool.clone(), cancel.clone());
@@ -145,7 +154,7 @@ async fn shutdown_completes_within_the_deadline_when_an_endpoint_never_answers(p
     seed(&store, &receiver, "/slow?ms=30000", 4).await;
 
     let deadline = Duration::from_millis(300);
-    let pool = Arc::new(Pool::new(store.clone(), config(deadline)));
+    let pool = Arc::new(Pool::with_config(store.clone(), config(deadline), local()));
     let cancel = CancellationToken::new();
     let handle = tokio::spawn({
         let (pool, cancel) = (pool.clone(), cancel.clone());
@@ -183,7 +192,7 @@ async fn a_delivery_claimed_but_not_yet_started_is_released(pool: PgPool) {
 
     // Cancelled before the loop ever runs, so the first claim happens with shutdown
     // already in progress and every row it takes has to be handed straight back.
-    let pool = Pool::new(store.clone(), config(Duration::from_secs(5)));
+    let pool = Pool::with_config(store.clone(), config(Duration::from_secs(5)), local());
     let cancel = CancellationToken::new();
     cancel.cancel();
     pool.run(cancel).await;
@@ -228,4 +237,16 @@ async fn the_reaper_stops_when_cancelled(pool: PgPool) {
         .await
         .expect("reaper ignored cancellation and slept out its interval")
         .expect("reaper loop");
+}
+
+/// Every receiver in these tests runs on loopback, which the strict policy refuses.
+///
+/// Opted into explicitly rather than making permissive the default. A default that
+/// allows internal addresses is a vulnerability that ships whenever somebody forgets
+/// to configure it, and the tests are exactly where that forgetting would hide.
+fn local() -> SenderConfig {
+    SenderConfig {
+        policy: Policy::permissive(),
+        ..Default::default()
+    }
 }

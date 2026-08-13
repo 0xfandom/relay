@@ -10,8 +10,8 @@
 
 use std::time::Duration;
 
-use relay_dispatcher::{Outcome, Pool, PoolConfig};
-use relay_domain::outcome::Class;
+use relay_dispatcher::{Outcome, Pool, PoolConfig, SenderConfig};
+use relay_domain::{outcome::Class, url_guard::Policy};
 use relay_store::Store;
 use relay_testkit::Receiver;
 use sqlx::PgPool;
@@ -35,7 +35,7 @@ async fn deliver_to(store: &Store, path: &str) -> Uuid {
         .await
         .expect("insert");
 
-    let pool = Pool::new(
+    let pool = Pool::with_config(
         store.clone(),
         PoolConfig {
             workers: 1,
@@ -43,6 +43,7 @@ async fn deliver_to(store: &Store, path: &str) -> Uuid {
             idle_poll: Duration::from_millis(10),
             shutdown_deadline: Duration::from_secs(5),
         },
+        local(),
     );
     assert_eq!(pool.run_once().await.expect("run"), 1);
 
@@ -110,7 +111,7 @@ async fn an_unreachable_host_is_retryable(pool: PgPool) {
         .await
         .expect("insert");
 
-    let pool = Pool::new(
+    let pool = Pool::with_config(
         store.clone(),
         PoolConfig {
             workers: 1,
@@ -118,6 +119,7 @@ async fn an_unreachable_host_is_retryable(pool: PgPool) {
             idle_poll: Duration::from_millis(10),
             shutdown_deadline: Duration::from_secs(5),
         },
+        local(),
     );
     assert_eq!(pool.run_once().await.expect("run"), 1);
 
@@ -147,7 +149,7 @@ async fn the_outcome_carries_the_class_to_the_caller(pool: PgPool) {
         .await
         .expect("insert");
 
-    let sender = relay_dispatcher::Sender::new(store.clone());
+    let sender = relay_dispatcher::Sender::with_config(store.clone(), local());
     let outcome = sender
         .deliver_by_id(accepted.delivery_ids[0])
         .await
@@ -162,5 +164,17 @@ async fn the_outcome_carries_the_class_to_the_caller(pool: PgPool) {
             assert_eq!(status, Some(500));
         }
         other => panic!("expected a failure, got {other:?}"),
+    }
+}
+
+/// Every receiver in these tests runs on loopback, which the strict policy refuses.
+///
+/// Opted into explicitly rather than making permissive the default. A default that
+/// allows internal addresses is a vulnerability that ships whenever somebody forgets
+/// to configure it, and the tests are exactly where that forgetting would hide.
+fn local() -> SenderConfig {
+    SenderConfig {
+        policy: Policy::permissive(),
+        ..Default::default()
     }
 }
