@@ -1,6 +1,6 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
-use relay_dispatcher::{Pool, PoolConfig};
+use relay_dispatcher::{Pool, PoolConfig, REQUEST_TIMEOUT, Reaper, ReaperConfig};
 use relay_store::Store;
 
 #[tokio::main]
@@ -21,15 +21,28 @@ async fn main() -> anyhow::Result<()> {
     // need enough that workers finishing together are not queueing for one.
     let db_connections = env_usize("RELAY_DB_CONNECTIONS", 8)?;
 
+    let reaper_config = ReaperConfig {
+        lease_ttl: Duration::from_secs(env_usize("RELAY_LEASE_TTL_SECS", 30)? as u64),
+        interval: Duration::from_secs(env_usize("RELAY_REAP_INTERVAL_SECS", 10)? as u64),
+    };
+
     let store = Store::connect(&database_url, db_connections as u32).await?;
     store.migrate().await?;
+
+    // Rejected at startup rather than tolerated, because a lease shorter than the
+    // request timeout produces duplicate deliveries and nothing else would report it.
+    let reaper = Arc::new(Reaper::new(store.clone(), reaper_config.clone())?);
 
     tracing::info!(
         workers = config.workers,
         batch_size = config.batch_size,
         db_connections,
+        lease_ttl = ?reaper_config.lease_ttl,
+        request_timeout = ?REQUEST_TIMEOUT,
         "relay-dispatcher started"
     );
+
+    tokio::spawn(async move { reaper.run().await });
 
     Pool::new(store, config).run().await
 }
