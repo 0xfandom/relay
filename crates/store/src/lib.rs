@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 pub mod models;
 
-pub use models::{Delivery, Endpoint, PendingDelivery};
+pub use models::{Attempt, Delivery, Endpoint, PendingDelivery};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -378,13 +378,21 @@ impl Store {
         outcome_class: &str,
         error: Option<&str>,
         response_snippet: Option<&str>,
+        worker_id: &str,
     ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
 
+        // `next_attempt_at` is written here as well as on the delivery. The
+        // deliveries table only ever holds the *latest* schedule, so without a copy
+        // per attempt the earlier ones are overwritten and the backoff cannot be
+        // audited after the fact.
         sqlx::query(
             "INSERT INTO delivery_attempts
-                 (delivery_id, attempt_no, http_status, latency_ms, outcome_class, error, response_snippet)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                 (delivery_id, attempt_no, http_status, latency_ms, outcome_class,
+                  error, response_snippet, worker_id, next_attempt_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
+                     CASE WHEN $9::double precision IS NULL THEN NULL
+                          ELSE now() + make_interval(secs => $9) END)",
         )
         .bind(delivery_id)
         .bind(attempt_no)
@@ -393,6 +401,8 @@ impl Store {
         .bind(outcome_class)
         .bind(error)
         .bind(response_snippet)
+        .bind(worker_id)
+        .bind(result.retry_delay().map(|d| d.as_secs_f64()))
         .execute(&mut *tx)
         .await?;
 
@@ -419,6 +429,24 @@ impl Store {
 
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Every attempt made on a delivery, oldest first.
+    ///
+    /// The whole history comes from this table alone — the deliveries row holds only
+    /// the current state, so it cannot answer "what happened on the third try".
+    pub async fn attempt_history(&self, delivery_id: Uuid) -> Result<Vec<Attempt>> {
+        let rows = sqlx::query_as::<_, Attempt>(
+            "SELECT delivery_id, attempt_no, http_status, latency_ms, outcome_class,
+                    error, response_snippet, worker_id, next_attempt_at, at
+             FROM delivery_attempts
+             WHERE delivery_id = $1
+             ORDER BY attempt_no",
+        )
+        .bind(delivery_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
     }
 
     pub async fn attempts_for(&self, delivery_id: Uuid) -> Result<i64> {
