@@ -7,13 +7,13 @@
 
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use rand::RngExt;
-use relay_store::Store;
+use relay_store::{DeadLetterFilter, DeadReason, Store};
 use serde::{Deserialize, Serialize};
 
 pub mod extract;
@@ -30,6 +30,9 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/v1/endpoints", post(create_endpoint))
         .route("/v1/events", post(ingest_event))
+        .route("/v1/dlq", get(list_dead_letters))
+        .route("/v1/dlq/replay", post(replay_many))
+        .route("/v1/deliveries/{id}/replay", post(replay_one))
         .with_state(state)
 }
 
@@ -143,12 +146,103 @@ fn event_type_from(headers: &HeaderMap, body: &[u8]) -> Option<String> {
         .map(str::to_string)
 }
 
+// --------------------------------------------------------------- dead letters
+
+/// Cap on how many dead letters one request may list or replay.
+///
+/// Not a suggestion. Replaying an unbounded set would schedule every parked
+/// delivery at once, aimed at an endpoint that has only just recovered — the exact
+/// flood the jittered backoff exists to prevent, delivered on purpose.
+const MAX_PAGE: i64 = 500;
+const DEFAULT_PAGE: i64 = 100;
+
+#[derive(Deserialize)]
+pub struct DlqQuery {
+    pub endpoint_id: Option<uuid::Uuid>,
+    /// `permanent_failure` or `attempts_exhausted`.
+    pub reason: Option<String>,
+    pub event_type: Option<String>,
+    pub limit: Option<i64>,
+}
+
+impl DlqQuery {
+    fn into_filter(self) -> Result<(DeadLetterFilter, i64), ApiError> {
+        let reason = match self.reason.as_deref() {
+            None => None,
+            Some(r) => Some(DeadReason::parse(r).ok_or_else(|| {
+                ApiError::BadRequest(format!(
+                    "unknown reason {r:?}, expected permanent_failure or attempts_exhausted"
+                ))
+            })?),
+        };
+        let limit = self.limit.unwrap_or(DEFAULT_PAGE).clamp(1, MAX_PAGE);
+        Ok((
+            DeadLetterFilter {
+                endpoint_id: self.endpoint_id,
+                reason,
+                event_type: self.event_type,
+            },
+            limit,
+        ))
+    }
+}
+
+/// `GET /v1/dlq`
+async fn list_dead_letters(
+    State(state): State<AppState>,
+    Query(q): Query<DlqQuery>,
+) -> Result<Response, ApiError> {
+    let (filter, limit) = q.into_filter()?;
+    let items = state.store.dead_letters(&filter, limit).await?;
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({ "count": items.len(), "items": items })),
+    )
+        .into_response())
+}
+
+/// `POST /v1/deliveries/{id}/replay`
+async fn replay_one(
+    State(state): State<AppState>,
+    Path(id): Path<uuid::Uuid>,
+) -> Result<Response, ApiError> {
+    // Only dead deliveries are replayable. Replaying one that is merely slow would
+    // hand a second worker a delivery the first is still sending.
+    if state.store.replay(id).await? {
+        Ok((
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({ "replayed": 1 })),
+        )
+            .into_response())
+    } else {
+        Err(ApiError::NotFound(
+            "no dead delivery with that id".to_string(),
+        ))
+    }
+}
+
+/// `POST /v1/dlq/replay`
+async fn replay_many(
+    State(state): State<AppState>,
+    Query(q): Query<DlqQuery>,
+) -> Result<Response, ApiError> {
+    let (filter, limit) = q.into_filter()?;
+    let replayed = state.store.replay_many(&filter, limit).await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "replayed": replayed, "limit": limit })),
+    )
+        .into_response())
+}
+
 // ---------------------------------------------------------------------- error
 
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
     #[error("{0}")]
     BadRequest(String),
+    #[error("{0}")]
+    NotFound(String),
     #[error(transparent)]
     Store(#[from] relay_store::StoreError),
 }
@@ -157,6 +251,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, msg) = match &self {
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m.clone()),
+            ApiError::NotFound(m) => (StatusCode::NOT_FOUND, m.clone()),
             ApiError::Store(e) => {
                 // Never leak database internals to a caller; log them instead.
                 tracing::error!(error = %e, "store error");
