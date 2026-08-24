@@ -16,6 +16,7 @@ internet, it fails constantly.
 | --- | --- |
 | Endpoint down for hours | Retry with jittered exponential backoff |
 | Endpoint never returns | Dead letter queue, replayable |
+| Endpoint that hangs, never replies | Per-endpoint in-flight cap, so other customers flow |
 | Large event bursts | Durable queue with a worker pool |
 | Slow endpoint | Per-endpoint token bucket rate limiting |
 | Dead endpoint, deep backlog | Circuit breaker with probing recovery |
@@ -183,6 +184,43 @@ Deferrals are still written to the attempt log with the class `deferred`, becaus
 Buckets live in the dispatcher process, so two dispatcher replicas each keep their
 own and the effective rate doubles. The fix is a shared bucket rather than a
 different algorithm; the arithmetic does not change.
+
+## One endpoint cannot take the pool with it
+
+An endpoint that accepts connections and then never replies is the worst kind of
+failure: nothing errors, nothing retries, the workers simply stop coming back for a
+full request timeout. With thirty-two workers and one such endpoint holding a deep
+backlog, every other customer's webhooks wait behind a server that is not even
+answering.
+
+Two caps, protecting different people:
+
+| Cap | Default | Protects |
+| --- | --- | --- |
+| `RELAY_MAX_PER_ENDPOINT` | 8 | other customers — the bulkhead |
+| `RELAY_MAX_IN_FLIGHT` | 64 | Relay's own sockets and memory |
+
+The global cap is deliberately independent of the worker count. A worker spends most
+of its life waiting on someone else's server, so "how many tasks" and "how many open
+sockets" are not the same question.
+
+The two are acquired differently, and that difference is the bulkhead:
+
+- **Per-endpoint is non-blocking.** No slot free means the delivery is deferred, and
+  the worker is free again within microseconds. Waiting here would tie a worker to an
+  endpoint that has stopped answering — precisely the coupling the cap exists to
+  break. The deferral delay is short and jittered, so a saturated endpoint's backlog
+  does not return in a single wave.
+- **Global is blocking.** Its holders are all actively sending, so a waiter is
+  waiting on work that is definitely progressing, and no single endpoint can
+  monopolise it because the per-endpoint cap already bounds any one endpoint's share.
+
+Like a rate-limit deferral, hitting either cap spends no attempt: nothing was sent,
+so nothing was learned about whether the endpoint works.
+
+Permits are released by `Drop`, so a task that panics mid-request returns its slots
+while unwinding. That has its own test, because the failure mode is invisible until
+the process has slowly leaked its whole allowance and quietly stops sending.
 
 ## At-least-once, and what receivers must do
 
