@@ -37,6 +37,11 @@ use uuid::Uuid;
 /// Customer error pages can be enormous. Store enough to debug with, no more.
 const SNIPPET_BYTES: usize = 2048;
 
+/// Longest a delivery waits after finding its endpoint at its concurrency cap.
+/// Jittered down from here, so a saturated endpoint's backlog does not return in a
+/// single wave.
+const BUSY_DEFER: Duration = Duration::from_millis(250);
+
 /// Ceiling on one outbound request, connect included.
 ///
 /// Public because the reaper's lease has to outlast it. If a lease could expire
@@ -151,6 +156,9 @@ pub struct Sender {
     /// Shared with every clone of this sender, so the whole worker pool draws on one
     /// bucket per endpoint rather than one each.
     limiter: Arc<Limiter>,
+    /// Also shared. A per-clone bulkhead would bound nothing, since the pool makes
+    /// one clone per delivery.
+    bulkhead: Arc<Bulkhead>,
 }
 
 /// How one delivery attempt behaves.
@@ -165,6 +173,8 @@ pub struct SenderConfig {
     /// Off only in tests that are exercising something else and would otherwise have
     /// to reason about token arithmetic to understand a failure.
     pub rate_limit: bool,
+    /// How many requests may be in flight, in total and per endpoint.
+    pub limits: Limits,
 }
 
 impl Default for SenderConfig {
@@ -173,6 +183,7 @@ impl Default for SenderConfig {
             backoff: Backoff::default(),
             policy: Policy::default(),
             rate_limit: true,
+            limits: Limits::default(),
         }
     }
 }
@@ -212,9 +223,15 @@ impl Sender {
             store,
             client,
             worker_id: format!("sender-{}", uuid::Uuid::new_v4()),
-            config,
             limiter: Arc::new(Limiter::new()),
+            bulkhead: Arc::new(Bulkhead::new(config.limits)),
+            config,
         }
+    }
+
+    /// The in-flight caps this sender is enforcing.
+    pub fn bulkhead(&self) -> &Bulkhead {
+        &self.bulkhead
     }
 
     /// The buckets this sender is enforcing. Exposed so tests and, later, metrics can
@@ -312,6 +329,36 @@ impl Sender {
         Ok(Outcome::Deferred { after })
     }
 
+    /// Put a delivery back because its endpoint already has all the requests it is
+    /// allowed to have in flight.
+    ///
+    /// Like a rate-limit deferral this spends no attempt — nothing was sent. The
+    /// delay is short and jittered rather than derived from anything: there is no way
+    /// to know when a slot will free up, and a fixed delay would bring every deferred
+    /// delivery for a saturated endpoint back at the same instant, only to defer them
+    /// all again.
+    async fn defer_busy(&self, p: PendingDelivery) -> Result<Outcome, SendError> {
+        let after = BUSY_DEFER.mul_f64(rand::random::<f64>().clamp(0.1, 1.0));
+        tracing::debug!(
+            delivery_id = %p.delivery_id,
+            endpoint_id = %p.endpoint_id,
+            ?after,
+            "deferred: endpoint at its concurrency cap"
+        );
+
+        self.store
+            .defer_delivery(
+                p.delivery_id,
+                p.attempt,
+                after,
+                "endpoint concurrency cap",
+                &self.worker_id,
+            )
+            .await?;
+
+        Ok(Outcome::Deferred { after })
+    }
+
     /// Record a delivery that was never sent because its destination was refused.
     async fn refuse(&self, p: PendingDelivery, refused: Refused) -> Result<Outcome, SendError> {
         let error = refused.to_string();
@@ -384,12 +431,27 @@ impl Sender {
     /// unclaimed row would reintroduce the duplicate-send bug, so the only callers
     /// are ones that have just claimed it.
     pub async fn deliver_claimed(&self, p: PendingDelivery) -> Result<Outcome, SendError> {
-        // First of all, before even a DNS lookup. The point of a rate limit is to do
-        // less work, and a deferral that had already resolved the host and signed the
-        // payload would have spent most of the cost of sending anyway.
+        // Both gates run before even a DNS lookup: a delivery that is going straight
+        // back on the queue should cost as little as possible on the way there.
+        //
+        // The bulkhead goes first, and the order is load-bearing. Taking a token and
+        // *then* finding no slot would spend that token on a request that was never
+        // made, and an endpoint at its concurrency cap would quietly receive less
+        // than its configured rate. Reserving first costs nothing — the reservation
+        // is released on every path out of here.
+        //
+        // Non-blocking on purpose. Waiting for this endpoint's slot would tie a
+        // worker to an endpoint that has stopped answering, which is exactly the
+        // coupling the cap exists to break.
+        let Some(reserved) = self.bulkhead.try_reserve(p.endpoint_id) else {
+            return self.defer_busy(p).await;
+        };
+
         if self.config.rate_limit {
             let rate = Rate::new(p.rate_per_second, p.burst);
             if let Take::Wait { after, .. } = self.limiter.take(p.endpoint_id, rate) {
+                // `reserved` is dropped here, returning the slot before the delivery
+                // goes back on the queue.
                 return self.defer(p, after).await;
             }
         }
@@ -401,6 +463,11 @@ impl Sender {
         if let Err(refused) = self.check_destination(&p.url).await {
             return self.refuse(p, refused).await;
         }
+
+        // Held for the whole request and released on the way out, panic included:
+        // both permits live in `_slot` and a dropped permit is returned to its
+        // semaphore however the scope is left.
+        let _slot = self.bulkhead.enter(reserved).await;
 
         let timestamp = unix_now();
 
@@ -568,6 +635,128 @@ impl Limiter {
     /// M7 will want.
     pub fn tracked(&self) -> usize {
         self.buckets.lock().expect("not poisoned").len()
+    }
+}
+
+/// Caps on how many requests may be in flight at once.
+///
+/// Two limits, and they exist for different people. The per-endpoint cap is a
+/// **bulkhead**: it protects other customers from one endpoint that has stopped
+/// answering. The global cap protects Relay itself — sockets, file descriptors, and
+/// the memory of every response being buffered at once — and has to be independent
+/// of the worker count, because a worker spends most of its life waiting and the
+/// two numbers are not the same question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// Total concurrent outbound requests from this process.
+    pub max_in_flight: usize,
+    /// Concurrent requests to any one endpoint.
+    ///
+    /// The number that decides whether a hanging endpoint is an incident or a
+    /// footnote. With no cap, an endpoint that accepts connections and never replies
+    /// absorbs every worker for a full request timeout, and every other customer's
+    /// webhooks wait behind it.
+    pub per_endpoint: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_in_flight: 64,
+            // Deliberately small next to the pool. One endpoint may use an eighth of
+            // it; the other seven eighths stay available to everybody else no matter
+            // how badly that one behaves.
+            per_endpoint: 8,
+        }
+    }
+}
+
+/// A reservation against one endpoint's share, not yet against the global pool.
+///
+/// Separate from [`Slot`] so the two are acquired in the right order and with the
+/// right blocking behaviour — see [`Bulkhead::try_reserve`].
+pub struct Reserved {
+    _endpoint: tokio::sync::OwnedSemaphorePermit,
+}
+
+/// Permission to have one request in flight. Both permits are released when this is
+/// dropped, including while unwinding from a panic.
+pub struct Slot {
+    _global: tokio::sync::OwnedSemaphorePermit,
+    _endpoint: Reserved,
+}
+
+/// Enforces [`Limits`].
+#[derive(Debug)]
+pub struct Bulkhead {
+    limits: Limits,
+    global: Arc<Semaphore>,
+    endpoints: Mutex<HashMap<Uuid, Arc<Semaphore>>>,
+}
+
+impl Bulkhead {
+    pub fn new(limits: Limits) -> Self {
+        Self {
+            limits,
+            global: Arc::new(Semaphore::new(limits.max_in_flight.max(1))),
+            endpoints: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Take one of this endpoint's slots, or fail immediately.
+    ///
+    /// Deliberately non-blocking, and that is the whole bulkhead. Waiting here would
+    /// hold a worker task hostage to an endpoint that has stopped answering, which is
+    /// precisely the coupling the per-endpoint cap exists to break. The caller defers
+    /// the delivery instead and the worker is free within microseconds.
+    pub fn try_reserve(&self, endpoint_id: Uuid) -> Option<Reserved> {
+        let semaphore = {
+            let mut endpoints = self.endpoints.lock().expect("not poisoned");
+            endpoints
+                .entry(endpoint_id)
+                .or_insert_with(|| Arc::new(Semaphore::new(self.limits.per_endpoint.max(1))))
+                .clone()
+        };
+        semaphore
+            .try_acquire_owned()
+            .ok()
+            .map(|_endpoint| Reserved { _endpoint })
+    }
+
+    /// Wait for room in the global pool, holding the endpoint reservation.
+    ///
+    /// Blocking is right here and wrong above. The global pool is shared fairly and
+    /// its holders are all actively sending, so a waiter is waiting on work that is
+    /// definitely progressing — and no single endpoint can monopolise it, because the
+    /// per-endpoint cap already bounds any one endpoint's share of it.
+    pub async fn enter(&self, endpoint: Reserved) -> Slot {
+        let global = self
+            .global
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("semaphore is never closed");
+        Slot {
+            _global: global,
+            _endpoint: endpoint,
+        }
+    }
+
+    /// Requests in flight right now.
+    pub fn in_flight(&self) -> usize {
+        self.limits
+            .max_in_flight
+            .max(1)
+            .saturating_sub(self.global.available_permits())
+    }
+
+    pub fn limits(&self) -> Limits {
+        self.limits
+    }
+
+    /// How many endpoints have a semaphore. Exposed for tests and M7's metrics.
+    pub fn tracked(&self) -> usize {
+        self.endpoints.lock().expect("not poisoned").len()
     }
 }
 
