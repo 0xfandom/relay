@@ -37,6 +37,7 @@ fn local(max_attempts: u32) -> SenderConfig {
         // Rate limiting off: these tests are about something else, and a deferral
         // would add attempt rows for requests that were never made.
         rate_limit: false,
+        limits: Default::default(),
     }
 }
 

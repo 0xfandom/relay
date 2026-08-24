@@ -15,7 +15,7 @@
 
 use std::time::{Duration, Instant};
 
-use relay_dispatcher::{Outcome, Pool, PoolConfig, Sender, SenderConfig};
+use relay_dispatcher::{Limits, Outcome, Pool, PoolConfig, Sender, SenderConfig};
 use relay_domain::{backoff::Backoff, rate_limit::Rate, url_guard::Policy};
 use relay_store::Store;
 use relay_testkit::Receiver;
@@ -33,6 +33,13 @@ fn limited() -> SenderConfig {
         },
         policy: Policy::permissive(),
         rate_limit: true,
+        // Wide, so the bucket is the only thing holding anything back. The
+        // concurrency caps are tested in `bulkhead.rs`; here they would only muddy
+        // which limit a deferral came from.
+        limits: Limits {
+            max_in_flight: 1024,
+            per_endpoint: 1024,
+        },
     }
 }
 
