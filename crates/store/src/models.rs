@@ -90,4 +90,8 @@ pub struct PendingDelivery {
     pub endpoint_id: Uuid,
     pub url: String,
     pub secret: String,
+    /// The endpoint's configured rate, carried on the claim so the sender needs no
+    /// second query to decide whether it is allowed to send yet.
+    pub rate_per_second: f64,
+    pub burst: f64,
 }

@@ -4,6 +4,7 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
+relay-domain = { version = "0.1.0", path = "../domain" }
 chrono = { version = "0.4.45", features = ["clock", "serde"], default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
@@ -14,4 +15,3 @@ uuid = { version = "1.24.0", features = ["v4", "serde"] }
 [dev-dependencies]
 # The claim tests spawn competing workers with JoinSet.
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
-relay-domain = { path = "../domain" }
