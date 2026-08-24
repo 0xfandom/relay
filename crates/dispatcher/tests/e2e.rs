@@ -279,6 +279,9 @@ async fn a_delivery_is_never_sent_twice_by_the_same_loop() {
 fn local() -> SenderConfig {
     SenderConfig {
         policy: Policy::permissive(),
+        // Rate limiting off: these tests are about something else, and a deferral
+        // would add attempt rows for requests that were never made.
+        rate_limit: false,
         ..Default::default()
     }
 }

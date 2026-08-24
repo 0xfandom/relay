@@ -276,6 +276,9 @@ async fn every_attempt_of_a_retried_delivery_reuses_one_delivery_id(pool: PgPool
 fn local() -> SenderConfig {
     SenderConfig {
         policy: Policy::permissive(),
+        // Rate limiting off: these tests are about something else, and a deferral
+        // would add attempt rows for requests that were never made.
+        rate_limit: false,
         ..Default::default()
     }
 }

@@ -359,6 +359,9 @@ async fn an_unknown_reason_filter_is_rejected(pool: PgPool) {
 fn local() -> SenderConfig {
     SenderConfig {
         policy: Policy::permissive(),
+        // Rate limiting off: these tests are about something else, and a deferral
+        // would add attempt rows for requests that were never made.
+        rate_limit: false,
         ..Default::default()
     }
 }
