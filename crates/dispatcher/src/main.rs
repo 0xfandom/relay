@@ -51,9 +51,16 @@ async fn main() -> anyhow::Result<()> {
     let allow_private = std::env::var("RELAY_ALLOW_PRIVATE_ENDPOINTS")
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
+    // Off only for a deliberate load test. A limiter that has to be switched on
+    // protects nobody, and the thing it protects is somebody else's server.
+    let rate_limit = std::env::var("RELAY_RATE_LIMIT")
+        .map(|v| !(v == "false" || v == "0"))
+        .unwrap_or(true);
+
     let sender_config = SenderConfig {
         backoff: Default::default(),
         policy: Policy { allow_private },
+        rate_limit,
     };
 
     let store = Store::connect(&database_url, db_connections as u32).await?;
@@ -73,6 +80,7 @@ async fn main() -> anyhow::Result<()> {
         request_timeout = ?REQUEST_TIMEOUT,
         shutdown_deadline = ?config.shutdown_deadline,
         allow_private_endpoints = allow_private,
+        rate_limit,
         "relay-dispatcher started"
     );
 

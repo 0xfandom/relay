@@ -14,9 +14,10 @@
 //! rather than about when to send again.
 
 use std::{
+    collections::HashMap,
     net::{IpAddr, SocketAddr},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -25,6 +26,7 @@ use std::{
 use relay_domain::{
     backoff::Backoff,
     outcome::{Class, Disposition, Transport, classify_status, classify_transport, disposition},
+    rate_limit::{Rate, Take},
     url_guard::{Policy, Refused},
 };
 use relay_store::{AttemptResult, DeadReason, PendingDelivery, Store};
@@ -65,6 +67,11 @@ pub enum Outcome {
         class: Class,
         status: Option<u16>,
         error: String,
+    },
+    /// Held back by the endpoint's rate limit. Nothing was sent, so this is not a
+    /// failure and does not spend an attempt.
+    Deferred {
+        after: Duration,
     },
 }
 
@@ -141,14 +148,33 @@ pub struct Sender {
     /// stranded work.
     worker_id: String,
     config: SenderConfig,
+    /// Shared with every clone of this sender, so the whole worker pool draws on one
+    /// bucket per endpoint rather than one each.
+    limiter: Arc<Limiter>,
 }
 
 /// How one delivery attempt behaves.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct SenderConfig {
     pub backoff: Backoff,
     /// Where deliveries are allowed to go. Strict by default — see [`Policy`].
     pub policy: Policy,
+    /// Whether to enforce the endpoint's configured rate.
+    ///
+    /// On by default, because a limiter that has to be switched on protects nobody.
+    /// Off only in tests that are exercising something else and would otherwise have
+    /// to reason about token arithmetic to understand a failure.
+    pub rate_limit: bool,
+}
+
+impl Default for SenderConfig {
+    fn default() -> Self {
+        Self {
+            backoff: Backoff::default(),
+            policy: Policy::default(),
+            rate_limit: true,
+        }
+    }
 }
 
 impl Sender {
@@ -187,7 +213,14 @@ impl Sender {
             client,
             worker_id: format!("sender-{}", uuid::Uuid::new_v4()),
             config,
+            limiter: Arc::new(Limiter::new()),
         }
+    }
+
+    /// The buckets this sender is enforcing. Exposed so tests and, later, metrics can
+    /// see them.
+    pub fn limiter(&self) -> &Limiter {
+        &self.limiter
     }
 
     /// Refuse a URL that points anywhere but the public internet.
@@ -246,6 +279,37 @@ impl Sender {
                 .next_delay(attempt, rand::random::<f64>()),
         };
         AttemptResult::Retry { delay }
+    }
+
+    /// Put a delivery back because its endpoint has no tokens left.
+    ///
+    /// Deliberately not a failed attempt. Nothing was sent, the endpoint was never
+    /// asked, and there is no evidence about whether it would have worked — so the
+    /// attempt counter is untouched. Charging for a deferral would let a busy
+    /// endpoint's deliveries die in the dead letter queue having never had a single
+    /// request made to them.
+    ///
+    /// The delay is the bucket's own answer to "when will there be a token", so a
+    /// deferred delivery comes back to a bucket that has one rather than bouncing.
+    async fn defer(&self, p: PendingDelivery, after: Duration) -> Result<Outcome, SendError> {
+        tracing::debug!(
+            delivery_id = %p.delivery_id,
+            endpoint_id = %p.endpoint_id,
+            ?after,
+            "deferred: endpoint rate limit"
+        );
+
+        self.store
+            .defer_delivery(
+                p.delivery_id,
+                p.attempt,
+                after,
+                "endpoint rate limit",
+                &self.worker_id,
+            )
+            .await?;
+
+        Ok(Outcome::Deferred { after })
     }
 
     /// Record a delivery that was never sent because its destination was refused.
@@ -320,10 +384,20 @@ impl Sender {
     /// unclaimed row would reintroduce the duplicate-send bug, so the only callers
     /// are ones that have just claimed it.
     pub async fn deliver_claimed(&self, p: PendingDelivery) -> Result<Outcome, SendError> {
-        // Before anything is signed or sent. A refused destination is permanent — no
-        // amount of retrying makes an internal address public — and nothing about the
-        // refusal is written back to the caller's response snippet, because the party
-        // who chose the URL must not learn what is listening at it.
+        // First of all, before even a DNS lookup. The point of a rate limit is to do
+        // less work, and a deferral that had already resolved the host and signed the
+        // payload would have spent most of the cost of sending anyway.
+        if self.config.rate_limit {
+            let rate = Rate::new(p.rate_per_second, p.burst);
+            if let Take::Wait { after, .. } = self.limiter.take(p.endpoint_id, rate) {
+                return self.defer(p, after).await;
+            }
+        }
+
+        // A refused destination is permanent — no amount of retrying makes an
+        // internal address public — and nothing about the refusal is written back to
+        // the caller's response snippet, because the party who chose the URL must not
+        // learn what is listening at it.
         if let Err(refused) = self.check_destination(&p.url).await {
             return self.refuse(p, refused).await;
         }
@@ -408,6 +482,9 @@ impl Sender {
             Outcome::Failed { class, .. } => {
                 (*class, self.next_step(*class, p.attempt, retry_after))
             }
+            // Unreachable: a deferral returns from `deliver_claimed` before any
+            // request is made, so no outcome reaches here carrying one.
+            Outcome::Deferred { .. } => unreachable!("a deferred delivery is never sent"),
         };
 
         // Whether the endpoint asked us to wait is a property of this attempt rather
@@ -432,6 +509,65 @@ impl Sender {
             .await?;
 
         Ok(outcome)
+    }
+}
+
+/// The token buckets, one per endpoint.
+///
+/// State lives in this process, which is the honest limitation to name up front:
+/// two dispatcher replicas each keep their own bucket, so a rate of 10/s configured
+/// on an endpoint is 10/s *per replica*. That is fine while Relay runs one
+/// dispatcher, and the fix when it does not is a shared bucket rather than a
+/// different algorithm — the arithmetic in [`relay_domain::rate_limit`] does not
+/// change.
+///
+/// A plain `std::sync::Mutex` rather than an async one. The critical section is a
+/// hash lookup and some floating-point arithmetic, with no `await` inside it, so an
+/// async mutex would add a scheduling hop to save nothing.
+#[derive(Debug, Default)]
+pub struct Limiter {
+    buckets: Mutex<HashMap<Uuid, Bucket>>,
+}
+
+#[derive(Debug)]
+struct Bucket {
+    tokens: f64,
+    /// When `tokens` was last correct. Refill is computed from this rather than
+    /// accrued on a timer, so an endpoint nobody is sending to costs nothing.
+    at: Instant,
+}
+
+impl Limiter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ask for permission to send one delivery to `endpoint_id`.
+    ///
+    /// The rate is passed per call rather than stored, because it arrives on the
+    /// claim: reconfiguring an endpoint then takes effect on its next delivery with
+    /// nothing to invalidate.
+    pub fn take(&self, endpoint_id: Uuid, rate: Rate) -> Take {
+        let now = Instant::now();
+        let mut buckets = self.buckets.lock().expect("bucket mutex is never poisoned");
+        let bucket = buckets.entry(endpoint_id).or_insert_with(|| Bucket {
+            // A new endpoint starts full. Starting empty would make the very first
+            // delivery to every endpoint wait for no reason, and the burst allowance
+            // exists precisely to absorb the first rush.
+            tokens: rate.burst,
+            at: now,
+        });
+
+        let take = rate.take(bucket.tokens, now.saturating_duration_since(bucket.at));
+        bucket.tokens = take.tokens();
+        bucket.at = now;
+        take
+    }
+
+    /// How many endpoints are being tracked. Exposed for tests and for the metrics
+    /// M7 will want.
+    pub fn tracked(&self) -> usize {
+        self.buckets.lock().expect("not poisoned").len()
     }
 }
 
