@@ -247,6 +247,9 @@ async fn the_reaper_stops_when_cancelled(pool: PgPool) {
 fn local() -> SenderConfig {
     SenderConfig {
         policy: Policy::permissive(),
+        // Rate limiting off: these tests are about something else, and a deferral
+        // would add attempt rows for requests that were never made.
+        rate_limit: false,
         ..Default::default()
     }
 }

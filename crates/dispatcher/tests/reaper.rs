@@ -266,6 +266,9 @@ fn dummy_store() -> Store {
 fn local() -> SenderConfig {
     SenderConfig {
         policy: Policy::permissive(),
+        // Rate limiting off: these tests are about something else, and a deferral
+        // would add attempt rows for requests that were never made.
+        rate_limit: false,
         ..Default::default()
     }
 }

@@ -279,6 +279,9 @@ async fn an_unknown_outcome_class_is_rejected_by_the_database(pool: PgPool) {
 fn local() -> SenderConfig {
     SenderConfig {
         policy: Policy::permissive(),
+        // Rate limiting off: these tests are about something else, and a deferral
+        // would add attempt rows for requests that were never made.
+        rate_limit: false,
         ..Default::default()
     }
 }
