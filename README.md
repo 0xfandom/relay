@@ -147,6 +147,43 @@ bytes matters: re-serialising JSON can reorder keys and invalidate every
 signature. Two signatures are sent during secret rotation so endpoints can
 migrate without failed deliveries.
 
+## How fast Relay sends
+
+Every other protection here reacts to a failure. The rate limit prevents one — and
+the failure it prevents is one Relay causes. A customer subscribes to a high-volume
+event, one burst fans out into ten thousand deliveries, their server falls over, and
+every one of those then fails, retries, and arrives again as a wave.
+
+Each endpoint has a sustained rate and a burst allowance:
+
+```bash
+curl -X POST 127.0.0.1:8080/v1/endpoints \
+  -H 'content-type: application/json' \
+  -d '{"url":"https://example.com/hook","rate_per_second":25,"burst":50}'
+```
+
+Defaults are 10/s with a burst of 20 — deliberately conservative, since Relay cannot
+know what a customer's server can take and the cost of guessing high is their
+outage.
+
+**A bucket, not a window.** Counting requests per fixed second is wrong at the
+boundary: ten at `t=0.99` and ten more at `t=1.01` are two legal seconds and twenty
+requests in twenty milliseconds. A bucket has no boundaries — tokens accrue
+continuously and are capped at `burst`, so the most that can ever leave at once is
+`burst`, however the traffic lines up with a clock.
+
+**A deferral is not a failure.** A delivery with no token available goes back to
+`pending`, scheduled for when a token will exist, and its attempt counter is left
+alone. This is the part that matters: if throttling spent an attempt, a busy
+endpoint's deliveries would reach the dead letter queue having never had a single
+request made to them — a retry budget consumed entirely by our own throttle.
+Deferrals are still written to the attempt log with the class `deferred`, because
+"held back for 300ms" is what someone asking why a webhook was late needs to see.
+
+Buckets live in the dispatcher process, so two dispatcher replicas each keep their
+own and the effective rate doubles. The fix is a shared bucket rather than a
+different algorithm; the arithmetic does not change.
+
 ## At-least-once, and what receivers must do
 
 Relay sends a webhook and no reply comes back. Two things can have happened: the
