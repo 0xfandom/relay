@@ -1,7 +1,8 @@
 use std::{sync::Arc, time::Duration};
 
 use relay_dispatcher::{
-    Pool, PoolConfig, Pruner, PrunerConfig, REQUEST_TIMEOUT, Reaper, ReaperConfig, SenderConfig,
+    Limits, Pool, PoolConfig, Pruner, PrunerConfig, REQUEST_TIMEOUT, Reaper, ReaperConfig,
+    SenderConfig,
 };
 use relay_domain::url_guard::Policy;
 use relay_store::Store;
@@ -57,10 +58,20 @@ async fn main() -> anyhow::Result<()> {
         .map(|v| !(v == "false" || v == "0"))
         .unwrap_or(true);
 
+    // Two different protections. The per-endpoint cap is a bulkhead — it stops one
+    // customer's dead server from absorbing the pool. The global cap protects Relay's
+    // own sockets and memory, and is independent of the worker count because a worker
+    // spends most of its life waiting.
+    let limits = Limits {
+        max_in_flight: env_usize("RELAY_MAX_IN_FLIGHT", 64)?,
+        per_endpoint: env_usize("RELAY_MAX_PER_ENDPOINT", 8)?,
+    };
+
     let sender_config = SenderConfig {
         backoff: Default::default(),
         policy: Policy { allow_private },
         rate_limit,
+        limits,
     };
 
     let store = Store::connect(&database_url, db_connections as u32).await?;
@@ -81,6 +92,8 @@ async fn main() -> anyhow::Result<()> {
         shutdown_deadline = ?config.shutdown_deadline,
         allow_private_endpoints = allow_private,
         rate_limit,
+        max_in_flight = limits.max_in_flight,
+        max_per_endpoint = limits.per_endpoint,
         "relay-dispatcher started"
     );
 
