@@ -21,7 +21,7 @@ use std::{
 };
 
 use relay_dispatcher::{Bulkhead, Limits, Pool, PoolConfig, SenderConfig};
-use relay_domain::{backoff::Backoff, url_guard::Policy};
+use relay_domain::{backoff::Backoff, rate_limit::Rate, url_guard::Policy};
 use relay_store::Store;
 use relay_testkit::Receiver;
 use sqlx::PgPool;
@@ -266,14 +266,22 @@ async fn hitting_the_cap_defers_rather_than_failing(pool: PgPool) {
 async fn a_delivery_stopped_by_the_bulkhead_does_not_spend_a_token(pool: PgPool) {
     let store = Store::from_pool(pool);
     let receiver = Receiver::new("whsec_bh_test");
-    // A generous rate, so the bucket is not what holds anything back, and a cap of
-    // one, so almost everything meets the bulkhead.
-    let ids = seed(&store, &receiver, "/slow?ms=250", 8).await;
+
+    // Exactly three tokens, and a refill rate slow enough that no fourth arrives
+    // during the test. Ten deliveries and a cap of one in flight, so nearly all of
+    // them meet the bulkhead.
+    //
+    // The assertion is a count, not a rate. Three tokens must buy three requests: no
+    // more, because the bucket says so, and — the point of this test — no fewer,
+    // because a delivery turned away by the bulkhead must not have spent one on the
+    // way. Taking a token and *then* finding no slot would leak it on a request that
+    // was never made, and the endpoint would quietly receive less than its
+    // configured rate: a limiter leaking capacity through a limiter.
+    const TOKENS: u64 = 3;
+    let ids = seed(&store, &receiver, "/verify", 10).await;
+    let endpoint = endpoint_of(&store, ids[0]).await;
     store
-        .set_endpoint_rate(
-            store_endpoint(&store, ids[0]).await,
-            relay_domain::rate_limit::Rate::new(1000.0, 8.0),
-        )
+        .set_endpoint_rate(endpoint, Rate::new(0.01, TOKENS as f64))
         .await
         .expect("set rate");
 
@@ -290,15 +298,35 @@ async fn a_delivery_stopped_by_the_bulkhead_does_not_spend_a_token(pool: PgPool)
         },
     );
 
-    let started = Instant::now();
-    while started.elapsed() < Duration::from_millis(1500) {
+    // Driven until the tokens are spent rather than for a fixed stretch of time. A
+    // cap of one serialises the sends and every bulkhead deferral waits out a
+    // jittered delay, so how long this takes depends on the machine — but how many
+    // get through does not.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while receiver.hits() < TOKENS && Instant::now() < deadline {
         sender.run_once().await.expect("run");
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    // The bulkhead is checked before the bucket for exactly this reason. Taking a
-    // token and then finding no slot would spend it on a request that was never
-    // made, and an endpoint at its concurrency cap would quietly receive less than
-    // its configured rate — a limiter leaking capacity through a limiter.
+    assert_eq!(
+        receiver.hits(),
+        TOKENS,
+        "three tokens must buy exactly three requests"
+    );
+
+    // A few more passes to prove the fourth never comes: the bucket is empty and
+    // nothing about being deferred by the bulkhead refills it.
+    for _ in 0..20 {
+        sender.run_once().await.expect("run");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        receiver.hits(),
+        TOKENS,
+        "the bucket handed out a fourth token"
+    );
+
+    // And nothing failed. Every outcome here is a send or a deferral.
     for id in &ids {
         let classes: Vec<String> = store
             .attempt_history(*id)
@@ -312,16 +340,10 @@ async fn a_delivery_stopped_by_the_bulkhead_does_not_spend_a_token(pool: PgPool)
             "unexpected outcome for {id}: {classes:?}"
         );
     }
-    assert!(
-        receiver.hits() >= 4,
-        "a bulkhead deferral ate the rate budget: only {} of 8 went out in 1.5s at \
-         1000/s with a cap of one in flight and a 250ms endpoint",
-        receiver.hits()
-    );
 }
 
 /// The endpoint a delivery belongs to.
-async fn store_endpoint(store: &Store, delivery_id: Uuid) -> Uuid {
+async fn endpoint_of(store: &Store, delivery_id: Uuid) -> Uuid {
     store
         .get_delivery(delivery_id)
         .await
