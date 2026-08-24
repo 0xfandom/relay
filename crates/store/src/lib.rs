@@ -26,6 +26,27 @@ pub enum StoreError {
     Migrate(#[from] sqlx::migrate::MigrateError),
     #[error("endpoint not found")]
     EndpointNotFound,
+    /// The key exists but was first used for a different event type or body.
+    /// A caller bug, not a race — and reported rather than swallowed, because the
+    /// alternative is answering the second request with the first one's result and
+    /// losing an event while looking successful.
+    #[error("idempotency key was already used for a different request")]
+    IdempotencyKeyReused,
+    /// Every attempt to claim a key both failed to insert and failed to find the
+    /// winner. Should be unreachable; kept because the alternative to giving up is
+    /// spinning forever.
+    #[error("could not resolve a concurrent request with the same idempotency key")]
+    IdempotencyRaceUnresolved,
+    #[error("could not encode response: {0}")]
+    Encode(serde_json::Error),
+}
+
+/// Whether an error is Postgres refusing a duplicate key.
+///
+/// `23505` is `unique_violation`. Matched on the SQLSTATE rather than the message
+/// text, which is localised and not a stable interface.
+fn is_unique_violation(e: &sqlx::Error) -> bool {
+    matches!(e, sqlx::Error::Database(db) if db.code().as_deref() == Some("23505"))
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -264,13 +285,32 @@ impl Store {
         raw_payload: &[u8],
     ) -> Result<Accepted> {
         let mut tx = self.pool.begin().await?;
+        let (event_id, delivery_ids) =
+            Self::insert_event_tx(&mut tx, event_type, raw_payload).await?;
+        tx.commit().await?;
 
+        Ok(Accepted {
+            event_id,
+            delivery_ids,
+        })
+    }
+
+    /// The event insert and its fan-out, without the transaction boundary.
+    ///
+    /// Factored out because the idempotent path needs the same two writes to share a
+    /// transaction with the key claim — and needs to be able to roll all three back
+    /// together when it loses the race.
+    async fn insert_event_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        event_type: &str,
+        raw_payload: &[u8],
+    ) -> Result<(Uuid, Vec<Uuid>)> {
         let event_id: Uuid = sqlx::query_scalar(
             "INSERT INTO events (event_type, raw_payload) VALUES ($1, $2) RETURNING id",
         )
         .bind(event_type)
         .bind(raw_payload)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await?;
 
         // An empty `event_types` array means "subscribe to everything", which keeps
@@ -284,15 +324,142 @@ impl Store {
         )
         .bind(event_id)
         .bind(event_type)
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut **tx)
         .await?;
 
-        tx.commit().await?;
+        Ok((event_id, delivery_ids))
+    }
 
-        Ok(Accepted {
-            event_id,
-            delivery_ids,
-        })
+    // ---------------------------------------------------------- idempotent ingest
+
+    /// How many times to re-resolve a lost race before giving up.
+    ///
+    /// One pass is normally enough: losing the unique-index race means the winner
+    /// has committed, so the next lookup finds it. A second pass only matters if the
+    /// winner's key was pruned in the microseconds in between, and a third exists so
+    /// that a pathological interleaving terminates rather than spinning.
+    const IDEMPOTENCY_ATTEMPTS: usize = 3;
+
+    /// Ingest an event at most once for a given key.
+    ///
+    /// The mechanism is the unique index on `idempotency_keys.key`, and the order of
+    /// operations is what makes it correct: the event and its deliveries are
+    /// inserted first, in the same transaction as the key. If the key insert loses,
+    /// the whole transaction rolls back and the event never existed — no orphan, no
+    /// half-fanned-out delivery set, no compensating cleanup to get wrong.
+    ///
+    /// The interesting case is two identical requests arriving at once. Both find no
+    /// key, both do the work, both try to insert. Postgres blocks the second insert
+    /// until the first transaction resolves rather than failing it immediately, so
+    /// the loser learns the truth instead of guessing at it:
+    ///
+    /// - winner commits → loser gets a unique violation, rolls back, reads the
+    ///   winner's row and returns it
+    /// - winner rolls back → loser's insert succeeds and it becomes the winner
+    ///
+    /// A unique violation is therefore not an error to report. Surfacing it as a
+    /// `5xx` would be the worst possible answer: the caller would retry, hit the same
+    /// race, and get the same `5xx` forever.
+    ///
+    /// Returns [`StoreError::IdempotencyKeyReused`] if the key exists but was first
+    /// used for a different request.
+    pub async fn insert_event_idempotent(
+        &self,
+        event_type: &str,
+        raw_payload: &[u8],
+        key: &str,
+        request_digest: &[u8],
+    ) -> Result<Ingested> {
+        for _ in 0..Self::IDEMPOTENCY_ATTEMPTS {
+            // Checked before doing any work, so the ordinary duplicate — a retry
+            // arriving well after the original — costs one indexed lookup rather
+            // than an event insert, a fan-out and a rollback.
+            if let Some(found) = self.find_idempotent(key, request_digest).await? {
+                return Ok(found);
+            }
+
+            let mut tx = self.pool.begin().await?;
+            let (event_id, delivery_ids) =
+                Self::insert_event_tx(&mut tx, event_type, raw_payload).await?;
+            let accepted = Accepted {
+                event_id,
+                delivery_ids,
+            };
+            // Serialised here rather than by the caller so that the bytes stored and
+            // the bytes returned are the same object, not two renderings that happen
+            // to agree today.
+            let response = serde_json::to_vec(&accepted).map_err(StoreError::Encode)?;
+
+            let claimed = sqlx::query(
+                "INSERT INTO idempotency_keys (key, event_id, request_digest, response)
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(key)
+            .bind(event_id)
+            .bind(request_digest)
+            .bind(&response)
+            .execute(&mut *tx)
+            .await;
+
+            match claimed {
+                Ok(_) => {
+                    tx.commit().await?;
+                    return Ok(Ingested {
+                        event_id,
+                        response,
+                        replayed: false,
+                    });
+                }
+                Err(e) if is_unique_violation(&e) => {
+                    // Undoes the event and every delivery row with it. This is the
+                    // whole reason the key insert shares their transaction.
+                    tx.rollback().await?;
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        Err(StoreError::IdempotencyRaceUnresolved)
+    }
+
+    /// The stored result for a key, if it has one and the request matches.
+    async fn find_idempotent(&self, key: &str, request_digest: &[u8]) -> Result<Option<Ingested>> {
+        let row: Option<(Uuid, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+            "SELECT event_id, request_digest, response FROM idempotency_keys WHERE key = $1",
+        )
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            None => Ok(None),
+            Some((event_id, stored_digest, response)) => {
+                if stored_digest != request_digest {
+                    return Err(StoreError::IdempotencyKeyReused);
+                }
+                Ok(Some(Ingested {
+                    event_id,
+                    response,
+                    replayed: true,
+                }))
+            }
+        }
+    }
+
+    /// Delete keys older than the retention window.
+    ///
+    /// Keys are only useful for as long as a producer might still retry, and that is
+    /// minutes. Keeping them permanently would grow this table as fast as the event
+    /// table to answer a question nobody asks after the first hour.
+    pub async fn prune_idempotency_keys(&self, older_than: Duration) -> Result<u64> {
+        let result = sqlx::query(
+            "DELETE FROM idempotency_keys WHERE created_at < now() - make_interval(secs => $1)",
+        )
+        .bind(older_than.as_secs_f64())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 
     // --------------------------------------------------------------- deliveries
@@ -570,6 +737,22 @@ impl Store {
 pub struct Accepted {
     pub event_id: Uuid,
     pub delivery_ids: Vec<Uuid>,
+}
+
+/// The outcome of an ingest that carried an idempotency key.
+///
+/// `response` is the body to send back, and it is the same bytes whether the event
+/// was created now or created an hour ago: stored verbatim on the first request and
+/// handed back untouched on every duplicate. A caller comparing two responses byte
+/// for byte gets equality, which is the property that makes a retry safe.
+#[derive(Debug, Clone)]
+pub struct Ingested {
+    pub event_id: Uuid,
+    pub response: Vec<u8>,
+    /// True when this request was recognised as a duplicate and nothing new was
+    /// created. Worth reporting to the caller: silently succeeding is correct, but
+    /// silently succeeding *for a different reason* is worth being able to see.
+    pub replayed: bool,
 }
 
 /// The states a delivery can finish an attempt in.
