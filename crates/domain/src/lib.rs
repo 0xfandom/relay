@@ -11,5 +11,6 @@
 pub mod backoff;
 pub mod idempotency;
 pub mod outcome;
+pub mod rate_limit;
 pub mod signature;
 pub mod url_guard;
