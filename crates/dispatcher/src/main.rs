@@ -1,6 +1,8 @@
 use std::{sync::Arc, time::Duration};
 
-use relay_dispatcher::{Pool, PoolConfig, REQUEST_TIMEOUT, Reaper, ReaperConfig, SenderConfig};
+use relay_dispatcher::{
+    Pool, PoolConfig, Pruner, PrunerConfig, REQUEST_TIMEOUT, Reaper, ReaperConfig, SenderConfig,
+};
 use relay_domain::url_guard::Policy;
 use relay_store::Store;
 use tokio_util::sync::CancellationToken;
@@ -31,6 +33,16 @@ async fn main() -> anyhow::Result<()> {
         interval: Duration::from_secs(env_usize("RELAY_REAP_INTERVAL_SECS", 10)? as u64),
     };
 
+    // How long a producer's retry is still recognised as a retry. Shortening it
+    // trades storage for a wider window in which a duplicate creates a second event.
+    let pruner_config = PrunerConfig {
+        retention: Duration::from_secs(env_usize(
+            "RELAY_IDEMPOTENCY_RETENTION_SECS",
+            relay_domain::idempotency::RETENTION.as_secs() as usize,
+        )? as u64),
+        interval: Duration::from_secs(env_usize("RELAY_PRUNE_INTERVAL_SECS", 3600)? as u64),
+    };
+
     // Off unless explicitly enabled. Relay will make an HTTP request to any URL a
     // customer registers, from inside a private network, so allowing internal
     // addresses turns it into a server-side request forgery engine — the cloud
@@ -50,12 +62,14 @@ async fn main() -> anyhow::Result<()> {
     // Rejected at startup rather than tolerated, because a lease shorter than the
     // request timeout produces duplicate deliveries and nothing else would report it.
     let reaper = Arc::new(Reaper::new(store.clone(), reaper_config.clone())?);
+    let pruner = Arc::new(Pruner::new(store.clone(), pruner_config.clone()));
 
     tracing::info!(
         workers = config.workers,
         batch_size = config.batch_size,
         db_connections,
         lease_ttl = ?reaper_config.lease_ttl,
+        idempotency_retention = ?pruner_config.retention,
         request_timeout = ?REQUEST_TIMEOUT,
         shutdown_deadline = ?config.shutdown_deadline,
         allow_private_endpoints = allow_private,
@@ -85,12 +99,18 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move { reaper.run(cancel).await })
     };
 
+    let pruner_loop = {
+        let cancel = cancel.clone();
+        tokio::spawn(async move { pruner.run(cancel).await })
+    };
+
     // Returns once cancelled and everything in flight has finished or hit the
     // deadline.
     Pool::with_config(store, config, sender_config)
         .run(cancel)
         .await;
     let _ = reaper_loop.await;
+    let _ = pruner_loop.await;
 
     tracing::info!("relay-dispatcher stopped");
     Ok(())

@@ -764,6 +764,90 @@ impl Reaper {
     }
 }
 
+/// How long an idempotency key is honoured, and how often expired ones are swept.
+#[derive(Debug, Clone)]
+pub struct PrunerConfig {
+    /// The retention window. A duplicate arriving after it creates a second event,
+    /// so this is a product decision as much as a storage one.
+    pub retention: Duration,
+    /// How often to sweep. Loose on purpose: a key that outlives its window by an
+    /// hour costs one row, while sweeping every ten seconds costs a scan.
+    pub interval: Duration,
+}
+
+impl Default for PrunerConfig {
+    fn default() -> Self {
+        Self {
+            retention: relay_domain::idempotency::RETENTION,
+            interval: Duration::from_secs(3600),
+        }
+    }
+}
+
+/// Deletes idempotency keys that have outlived their window.
+///
+/// Lives beside the reaper rather than in the API for the same reason the reaper
+/// does: the API is request-scoped and scales with traffic, so a sweep there would
+/// run once per replica per request path and contend with the ingest it is meant to
+/// protect. This process already exists to run periodic work.
+///
+/// Nothing depends on it for correctness — a key that is never pruned still
+/// deduplicates. What it prevents is a table that grows as fast as the event table
+/// and never shrinks, to answer a question nobody asks after the first hour.
+pub struct Pruner {
+    store: Store,
+    config: PrunerConfig,
+    pruned: AtomicU64,
+}
+
+impl Pruner {
+    pub fn new(store: Store, config: PrunerConfig) -> Self {
+        Self {
+            store,
+            config,
+            pruned: AtomicU64::new(0),
+        }
+    }
+
+    /// Keys deleted since start.
+    pub fn pruned(&self) -> u64 {
+        self.pruned.load(Ordering::Relaxed)
+    }
+
+    pub async fn prune_once(&self) -> Result<u64, SendError> {
+        let n = self
+            .store
+            .prune_idempotency_keys(self.config.retention)
+            .await?;
+        if n > 0 {
+            self.pruned.fetch_add(n, Ordering::Relaxed);
+            // Info, not warn. Unlike the reaper's count, a non-zero number here is
+            // the system working.
+            tracing::info!(
+                pruned = n,
+                retention = ?self.config.retention,
+                "deleted expired idempotency keys"
+            );
+        }
+        Ok(n)
+    }
+
+    pub async fn run(&self, cancel: CancellationToken) {
+        loop {
+            if let Err(e) = self.prune_once().await {
+                tracing::error!(error = %e, "pruner failed");
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(self.config.interval) => {}
+                _ = cancel.cancelled() => {
+                    tracing::info!(pruned = self.pruned(), "pruner stopped");
+                    return;
+                }
+            }
+        }
+    }
+}
+
 fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
