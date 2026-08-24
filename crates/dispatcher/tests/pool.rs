@@ -14,7 +14,7 @@
 
 use std::{sync::Arc, time::Duration};
 
-use relay_dispatcher::{Pool, PoolConfig, SenderConfig};
+use relay_dispatcher::{Limits, Pool, PoolConfig, SenderConfig};
 use relay_domain::url_guard::Policy;
 use relay_store::Store;
 use relay_testkit::Receiver;
@@ -250,6 +250,14 @@ fn local() -> SenderConfig {
         // Rate limiting off: these tests are about something else, and a deferral
         // would add attempt rows for requests that were never made.
         rate_limit: false,
+        // Same reasoning for the in-flight caps. This file asserts the *worker pool*
+        // is the bound on concurrency, so the bulkhead has to be wide enough not to
+        // become the bound instead — `crates/dispatcher/tests/bulkhead.rs` is where
+        // that one is tested.
+        limits: Limits {
+            max_in_flight: 1024,
+            per_endpoint: 1024,
+        },
         ..Default::default()
     }
 }
