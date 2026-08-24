@@ -8,12 +8,12 @@
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderName, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use rand::RngExt;
-use relay_domain::url_guard::Policy;
+use relay_domain::{idempotency, url_guard::Policy};
 use relay_store::{DeadLetterFilter, DeadReason, Store};
 use serde::{Deserialize, Serialize};
 
@@ -110,12 +110,6 @@ fn generate_secret() -> String {
 
 // --------------------------------------------------------------------- events
 
-#[derive(Serialize)]
-pub struct Accepted {
-    pub event_id: uuid::Uuid,
-    pub delivery_ids: Vec<uuid::Uuid>,
-}
-
 /// `POST /v1/events`
 ///
 /// The body is taken as raw bytes and stored verbatim. The event type is read
@@ -126,6 +120,12 @@ pub struct Accepted {
 /// parsed value is thrown away. What must never happen is parsing it, storing the
 /// parsed form, and re-serialising it later — that changes the bytes the
 /// signature covers.
+///
+/// An `Idempotency-Key` header makes the request safe to retry: a second request
+/// carrying the same key creates nothing and is answered with the first one's
+/// response, byte for byte. Without the header every request creates an event,
+/// because two identical bodies a second apart may be a retry or may be two real
+/// events, and only the producer knows which.
 async fn ingest_event(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -134,19 +134,54 @@ async fn ingest_event(
     let event_type = event_type_from(&headers, &body)
         .ok_or_else(|| ApiError::BadRequest("missing event type".into()))?;
 
-    let accepted = state
+    let Some(key) = idempotency_key(&headers)? else {
+        let accepted = state
+            .store
+            .insert_event_and_fan_out(&event_type, &body)
+            .await?;
+        return Ok((StatusCode::ACCEPTED, Json(accepted)).into_response());
+    };
+
+    // Covers the type as well as the body, because fanning out to a different set
+    // of endpoints is a different request even when the payload is identical.
+    let digest = idempotency::digest(&event_type, &body);
+    let ingested = state
         .store
-        .insert_event_and_fan_out(&event_type, &body)
+        .insert_event_idempotent(&event_type, &body, &key, &digest)
         .await?;
 
+    // The stored bytes, returned untouched. Re-rendering them from a parsed form
+    // would risk a different key order or a different delivery id order, and a
+    // caller comparing two responses would see a difference that is not there.
     Ok((
         StatusCode::ACCEPTED,
-        Json(Accepted {
-            event_id: accepted.event_id,
-            delivery_ids: accepted.delivery_ids,
-        }),
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (
+                HeaderName::from_static("relay-idempotent-replay"),
+                if ingested.replayed { "true" } else { "false" },
+            ),
+        ],
+        ingested.response,
     )
         .into_response())
+}
+
+/// The `Idempotency-Key` header, validated.
+///
+/// `Ok(None)` means the header was absent, which is allowed. A present but unusable
+/// key is refused rather than ignored: silently dropping it would turn a request the
+/// caller believes is deduplicated into one that is not, and they would find out by
+/// billing someone twice.
+fn idempotency_key(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
+    let Some(raw) = headers.get("idempotency-key") else {
+        return Ok(None);
+    };
+    let key = raw
+        .to_str()
+        .map_err(|_| ApiError::BadRequest(idempotency::BadKey::Unprintable.to_string()))?;
+    idempotency::check_key(key).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    Ok(Some(key.to_string()))
 }
 
 fn event_type_from(headers: &HeaderMap, body: &[u8]) -> Option<String> {
@@ -270,6 +305,14 @@ impl IntoResponse for ApiError {
         let (status, msg) = match &self {
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m.clone()),
             ApiError::NotFound(m) => (StatusCode::NOT_FOUND, m.clone()),
+            // The caller reused one key for two different requests. Their bug, and
+            // one they can only fix if we say so — answering with the first
+            // request's result instead would drop the second event while looking
+            // like a success.
+            ApiError::Store(relay_store::StoreError::IdempotencyKeyReused) => (
+                StatusCode::CONFLICT,
+                "idempotency key was already used for a different request".to_string(),
+            ),
             ApiError::Store(e) => {
                 // Never leak database internals to a caller; log them instead.
                 tracing::error!(error = %e, "store error");
