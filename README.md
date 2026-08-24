@@ -147,6 +147,46 @@ bytes matters: re-serialising JSON can reorder keys and invalidate every
 signature. Two signatures are sent during secret rotation so endpoints can
 migrate without failed deliveries.
 
+## At-least-once, and what receivers must do
+
+Relay sends a webhook and no reply comes back. Two things can have happened: the
+endpoint never received it, or it received it, processed it, and the acknowledgement
+was lost. Those are indistinguishable from our side — permanently, not merely in
+practice. Exactly-once delivery over a network we do not control is not achievable,
+and no amount of design changes that.
+
+Given the choice, Relay retries. Losing an event is worse than sending one twice.
+That makes the guarantee **at-least-once**: a receiver will occasionally see the
+same webhook more than once, and it is expected to cope.
+
+`Relay-Delivery-Id` is what makes coping possible. It is fixed when the delivery row
+is created and repeated on every attempt, so:
+
+```
+store the ids you have processed
+on each webhook:
+    if the id is already stored -> acknowledge and stop
+    otherwise                   -> process, store the id, acknowledge
+```
+
+Three properties receivers can rely on:
+
+- **Constant across retries.** Attempt 1 and attempt 8 of one delivery carry the
+  same id. If it changed per attempt, every retry would look like a new event.
+- **Constant across replays.** Draining the dead letter queue retries *that*
+  delivery rather than creating a new one, so a receiver that already processed it
+  will correctly ignore the replay. The generation counter moves; the id does not.
+- **One per endpoint, not per event.** An event fanning out to three endpoints
+  produces three ids, so two endpoints sharing a deduplication store never discard
+  each other's webhooks.
+
+The id does not prevent duplicates. It makes them detectable, which is the strongest
+thing anyone can offer.
+
+Storing every id forever is not required — Relay stops retrying a delivery once it
+is dead, so a receiver only needs to remember ids for as long as retries can still
+arrive.
+
 ## Where deliveries may go
 
 Relay makes an HTTP request to whatever URL a customer registers, from a machine
