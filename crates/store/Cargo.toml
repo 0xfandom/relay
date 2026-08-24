@@ -14,3 +14,4 @@ uuid = { version = "1.24.0", features = ["v4", "serde"] }
 [dev-dependencies]
 # The claim tests spawn competing workers with JoinSet.
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
+relay-domain = { path = "../domain" }
