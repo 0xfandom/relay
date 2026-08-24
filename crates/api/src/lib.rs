@@ -13,7 +13,7 @@ use axum::{
     routing::{get, post},
 };
 use rand::RngExt;
-use relay_domain::{idempotency, url_guard::Policy};
+use relay_domain::{idempotency, rate_limit::Rate, url_guard::Policy};
 use relay_store::{DeadLetterFilter, DeadReason, Store};
 use serde::{Deserialize, Serialize};
 
@@ -52,6 +52,10 @@ pub struct CreateEndpoint {
     /// Empty or absent means "every event type".
     #[serde(default)]
     pub event_types: Vec<String>,
+    /// Sustained deliveries per second. Absent means the conservative default.
+    pub rate_per_second: Option<f64>,
+    /// The most that may leave at once after an idle period. Defaults with the rate.
+    pub burst: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -60,6 +64,9 @@ pub struct CreatedEndpoint {
     pub url: String,
     /// Returned exactly once, at creation. Relay stores it but never shows it again.
     pub secret: String,
+    /// Echoed back so the caller can see what they got when they configured nothing.
+    pub rate_per_second: f64,
+    pub burst: f64,
 }
 
 async fn create_endpoint(
@@ -79,11 +86,20 @@ async fn create_endpoint(
         return Err(ApiError::BadRequest("url has no host".into()));
     }
 
+    let rate = requested_rate(&req)?;
+
     let secret = generate_secret();
     let ep = state
         .store
         .create_endpoint(&req.url, &secret, &req.event_types)
         .await?;
+
+    // Applied after creation rather than passed into it, so that the overwhelmingly
+    // common case — no rate specified — needs no configuration and touches nothing.
+    if let Some(rate) = rate {
+        state.store.set_endpoint_rate(ep.id, rate).await?;
+    }
+    let rate = rate.unwrap_or_default();
 
     Ok((
         StatusCode::CREATED,
@@ -91,9 +107,39 @@ async fn create_endpoint(
             id: ep.id,
             url: ep.url,
             secret,
+            rate_per_second: rate.per_second,
+            burst: rate.burst,
         }),
     )
         .into_response())
+}
+
+/// The rate the caller asked for, validated, or `None` to keep the default.
+///
+/// Rejected here rather than left to the database's CHECK constraint, because a
+/// constraint violation reaches the caller as an opaque `500`. A rate of zero is not
+/// "unlimited" — it is "never", and it would park every delivery to this endpoint
+/// forever while looking like configuration.
+fn requested_rate(req: &CreateEndpoint) -> Result<Option<Rate>, ApiError> {
+    if req.rate_per_second.is_none() && req.burst.is_none() {
+        return Ok(None);
+    }
+    let default = Rate::default();
+    let per_second = req.rate_per_second.unwrap_or(default.per_second);
+    let burst = req.burst.unwrap_or(default.burst);
+
+    if !per_second.is_finite() || per_second <= 0.0 {
+        return Err(ApiError::BadRequest(format!(
+            "rate_per_second must be a positive number, got {per_second}"
+        )));
+    }
+    // A bucket that cannot hold one whole token can never spend one.
+    if !burst.is_finite() || burst < 1.0 {
+        return Err(ApiError::BadRequest(format!(
+            "burst must be at least 1, got {burst}"
+        )));
+    }
+    Ok(Some(Rate::new(per_second, burst)))
 }
 
 fn reqwest_url(url: &str) -> Result<url::Url, ApiError> {
