@@ -18,3 +18,10 @@ tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
 url = "2.5.8"
 uuid = "1.24.0"
+
+[dev-dependencies]
+# The concurrency test drives the real router over a real socket: 100 simultaneous
+# requests through axum's own extractors is the only way to prove that losing the
+# race never reaches the caller as a 5xx.
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "charset"] }
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "postgres", "uuid", "chrono", "migrate", "macros"] }
