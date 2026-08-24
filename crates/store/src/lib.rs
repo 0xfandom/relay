@@ -10,6 +10,7 @@
 
 use std::time::Duration;
 
+use relay_domain::rate_limit::Rate;
 use serde::Serialize;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use uuid::Uuid;
@@ -88,7 +89,9 @@ const CLAIM_BATCH_SQL: &str = concat!(
             e.raw_payload AS raw_payload,
             ep.id         AS endpoint_id,
             ep.url        AS url,
-            ep.secret     AS secret
+            ep.secret     AS secret,
+            ep.rate_per_second AS rate_per_second,
+            ep.burst      AS burst
      FROM claimed c
      JOIN events    e  ON e.id  = c.event_id
      JOIN endpoints ep ON ep.id = c.endpoint_id"
@@ -241,6 +244,25 @@ impl Store {
     }
 
     // ---------------------------------------------------------------- endpoints
+
+    /// Change how fast an endpoint may be sent to.
+    ///
+    /// Separate from creation so that the common case needs no configuration: an
+    /// endpoint starts at the schema's conservative default and is raised once
+    /// someone knows what the destination can take.
+    pub async fn set_endpoint_rate(&self, endpoint_id: Uuid, rate: Rate) -> Result<()> {
+        let result =
+            sqlx::query("UPDATE endpoints SET rate_per_second = $2, burst = $3 WHERE id = $1")
+                .bind(endpoint_id)
+                .bind(rate.per_second)
+                .bind(rate.burst)
+                .execute(&self.pool)
+                .await?;
+        if result.rows_affected() == 0 {
+            return Err(StoreError::EndpointNotFound);
+        }
+        Ok(())
+    }
 
     pub async fn create_endpoint(
         &self,
@@ -476,7 +498,9 @@ impl Store {
                     e.raw_payload   AS raw_payload,
                     ep.id           AS endpoint_id,
                     ep.url          AS url,
-                    ep.secret       AS secret
+                    ep.secret       AS secret,
+                    ep.rate_per_second AS rate_per_second,
+                    ep.burst        AS burst
              FROM deliveries d
              JOIN events    e  ON e.id  = d.event_id
              JOIN endpoints ep ON ep.id = d.endpoint_id
@@ -501,7 +525,9 @@ impl Store {
                     e.raw_payload   AS raw_payload,
                     ep.id           AS endpoint_id,
                     ep.url          AS url,
-                    ep.secret       AS secret
+                    ep.secret       AS secret,
+                    ep.rate_per_second AS rate_per_second,
+                    ep.burst        AS burst
              FROM deliveries d
              JOIN events    e  ON e.id  = d.event_id
              JOIN endpoints ep ON ep.id = d.endpoint_id
@@ -596,6 +622,63 @@ impl Store {
         .bind(result.status().as_str())
         .bind(result.retry_delay().map(|d| d.as_secs_f64()))
         .bind(result.dead_reason().map(|r| r.as_str()))
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Put a claimed delivery back without spending an attempt.
+    ///
+    /// The distinction from [`Store::finish_attempt`] is the whole point: a deferral
+    /// is not a failure. Nothing was sent, the endpoint was never asked, and there is
+    /// no information about whether it would have worked. Charging an attempt for it
+    /// would mean a busy endpoint's deliveries reach the dead letter queue having
+    /// never had a single request made to them — a retry budget spent entirely on our
+    /// own throttle.
+    ///
+    /// So `attempt` is left alone and the row goes back to `pending`, due when the
+    /// caller says. The attempt log still gets a row, because "we held this back for
+    /// 300ms" is exactly the kind of thing someone asking why a webhook was late
+    /// needs to see.
+    pub async fn defer_delivery(
+        &self,
+        delivery_id: Uuid,
+        attempt_no: i32,
+        delay: Duration,
+        reason: &str,
+        worker_id: &str,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query(
+            "INSERT INTO delivery_attempts
+                 (delivery_id, attempt_no, http_status, latency_ms, outcome_class,
+                  error, response_snippet, worker_id, next_attempt_at, generation)
+             VALUES ($1, $2, NULL, 0, 'deferred', $3, NULL, $4,
+                     now() + make_interval(secs => $5),
+                     (SELECT generation FROM deliveries WHERE id = $1))",
+        )
+        .bind(delivery_id)
+        .bind(attempt_no)
+        .bind(reason)
+        .bind(worker_id)
+        .bind(delay.as_secs_f64())
+        .execute(&mut *tx)
+        .await?;
+
+        // Note the absent `attempt = attempt + 1`.
+        sqlx::query(
+            "UPDATE deliveries
+             SET status = 'pending',
+                 locked_at = NULL,
+                 locked_by = NULL,
+                 next_attempt_at = now() + make_interval(secs => $2)
+             WHERE id = $1",
+        )
+        .bind(delivery_id)
+        .bind(delay.as_secs_f64())
         .execute(&mut *tx)
         .await?;
 
