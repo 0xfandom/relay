@@ -94,6 +94,44 @@ The receiver exposes failure modes for testing delivery behaviour:
 `/always500`, `/slow?ms=`, `/flaky?pct=`, `/429?retry_after=`, and `/verify`,
 which checks the signature and the freshness window.
 
+## Sending an event more than once
+
+A producer whose `POST /v1/events` times out cannot tell whether Relay received it.
+Not retrying loses the event; retrying creates a second one. Name the request and
+the ambiguity goes away:
+
+```bash
+curl -X POST 127.0.0.1:8080/v1/events \
+  -H 'content-type: application/json' \
+  -H 'idempotency-key: order-123-paid' \
+  -d '{"type":"order.paid","amount":4999}'
+```
+
+The first request with a given key creates the event and stores the exact bytes of
+its `202` body. Every later request with that key creates nothing and is answered
+with those same bytes, so a caller comparing two responses gets equality rather
+than two different event ids. Duplicates carry `Relay-Idempotent-Replay: true`.
+
+Concurrency is handled by the database, not by application code: the key is a
+primary key, the event and its fan-out are inserted in the same transaction that
+claims it, and a losing insert rolls all of it back and returns the winner's
+response. A hundred simultaneous identical requests produce one event, one delivery
+per endpoint, a hundred identical bodies and no `5xx`.
+
+Two rules worth knowing before relying on it:
+
+- **The key is scoped to the request.** Reusing one key for a different event type
+  or body is `409 Conflict`, not a silent replay. Being answered with the earlier
+  event's id would drop the second event while reporting success.
+- **Keys expire after 24 hours** (`RELAY_IDEMPOTENCY_RETENTION_SECS`). A duplicate
+  arriving after that creates a second event. Keeping keys forever would grow that
+  table as fast as the event table to answer a question nobody asks after the first
+  hour.
+
+Without the header nothing is deduplicated, which is deliberate: two identical
+bodies a second apart may be a retry or two real orders, and only the producer
+knows which.
+
 ## Signature format
 
 Modelled on Stripe's scheme, so existing receiver implementations apply.
