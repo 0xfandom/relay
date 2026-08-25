@@ -3,7 +3,7 @@ use relay_store::Store;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    relay_metrics::logging::init();
 
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://relay:relay@localhost:5433/relay".into());

@@ -13,3 +13,5 @@ relay-store = { version = "0.1.0", path = "../store" }
 tokio = { version = "1.53.1", features = ["net", "rt"] }
 tokio-util = "0.7.19"
 tracing = "0.1.44"
+# `json` for structured production output, `env-filter` for RUST_LOG.
+tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
