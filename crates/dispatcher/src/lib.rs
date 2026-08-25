@@ -34,6 +34,7 @@ use relay_domain::{
 use relay_store::{AttemptResult, DeadReason, PendingDelivery, Store};
 use tokio::{sync::Semaphore, task::JoinSet};
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 use uuid::Uuid;
 
 /// Customer error pages can be enormous. Store enough to debug with, no more.
@@ -528,6 +529,17 @@ impl Sender {
         self.deliver(pending).await
     }
 
+    #[tracing::instrument(
+        name = "delivery",
+        skip_all,
+        fields(
+            delivery_id = %p.delivery_id,
+            endpoint_id = %p.endpoint_id,
+            event_type = %p.event_type,
+            attempt = p.attempt,
+            outcome = tracing::field::Empty,
+        )
+    )]
     async fn deliver(&self, p: PendingDelivery) -> Result<Option<Outcome>, SendError> {
         // Claim before sending, not after.
         //
@@ -541,16 +553,13 @@ impl Sender {
         self.deliver_claimed(p).await.map(Some)
     }
 
-    /// Send a delivery that has *already* been claimed, and record the outcome.
+    /// Decide whether this delivery may go out right now.
     ///
-    /// Separate from [`Sender::deliver`] because the worker pool claims a whole
-    /// batch in one query and then fans the rows out. Calling this with an
-    /// unclaimed row would reintroduce the duplicate-send bug, so the only callers
-    /// are ones that have just claimed it.
-    pub async fn deliver_claimed(&self, p: PendingDelivery) -> Result<Outcome, SendError> {
-        // Both gates run before even a DNS lookup: a delivery that is going straight
-        // back on the queue should cost as little as possible on the way there.
-        //
+    /// Extracted from the send path so the whole decision is one span and one
+    /// return value. Every gate here runs before even a DNS lookup: a delivery that
+    /// is going straight back on the queue should cost as little as possible on the
+    /// way there.
+    async fn gate(&self, p: &PendingDelivery) -> Result<Gated, SendError> {
         // The bulkhead goes first, and the order is load-bearing. Taking a token and
         // *then* finding no slot would spend that token on a request that was never
         // made, and an endpoint at its concurrency cap would quietly receive less
@@ -561,7 +570,8 @@ impl Sender {
         // worker to an endpoint that has stopped answering, which is exactly the
         // coupling the cap exists to break.
         let Some(reserved) = self.bulkhead.try_reserve(p.endpoint_id) else {
-            return self.defer_busy(p).await;
+            tracing::debug!(gate = "bulkhead", "held: endpoint at its concurrency cap");
+            return Ok(Gated::Busy);
         };
 
         if self.config.rate_limit {
@@ -569,7 +579,8 @@ impl Sender {
             if let Take::Wait { after, .. } = self.limiter.take(p.endpoint_id, rate) {
                 // `reserved` is dropped here, returning the slot before the delivery
                 // goes back on the queue.
-                return self.defer(p, after).await;
+                tracing::debug!(gate = "rate_limit", ?after, "held: no token yet");
+                return Ok(Gated::RateLimited { after });
             }
         }
 
@@ -577,46 +588,86 @@ impl Sender {
         // already failed `threshold` times in a row and every delivery to it is
         // costing a worker a full request timeout to learn what the last thousand
         // established.
-        let mut probing = false;
-        if self.config.breaker.is_some() {
-            match breaker_gate(&p, Utc::now()) {
-                Gate::Send => {}
-                Gate::Probe => {
-                    // The cooldown has expired, but that is true for every worker
-                    // holding a delivery to this endpoint. Exactly one may go — a
-                    // server that has just come back after an hour down, met by the
-                    // whole backlog at once, is very likely to fall over again, and
-                    // the breaker would reopen with a longer cooldown. The outage
-                    // would extend itself.
-                    //
-                    // The database picks the winner; the losers wait for the probe's
-                    // deadline like any other blocked delivery.
-                    if self
-                        .store
-                        .claim_probe(p.endpoint_id, PROBE_DEADLINE)
-                        .await?
-                    {
-                        probing = true;
-                        self.probes.fetch_add(1, Ordering::Relaxed);
-                        relay_metrics::probe_issued();
-                        tracing::info!(endpoint_id = %p.endpoint_id, delivery_id = %p.delivery_id,
-                            "probing a recovering endpoint");
-                    } else {
-                        // Briefly, not until the probe's deadline. The deadline
-                        // governs when a *new* probe may be claimed if this one
-                        // never reports; it is not how long everybody else should
-                        // wait. A probe resolves within one request timeout, and if
-                        // it succeeds the breaker is closed by then — deferring the
-                        // backlog for the full deadline would leave a recovered
-                        // endpoint idle while its deliveries sat waiting on a
-                        // question that had already been answered.
-                        return self.defer_probe_in_flight(p).await;
-                    }
+        if self.config.breaker.is_none() {
+            return Ok(Gated::Go {
+                reserved,
+                probing: false,
+            });
+        }
+
+        match breaker_gate(p, Utc::now()) {
+            Gate::Send => Ok(Gated::Go {
+                reserved,
+                probing: false,
+            }),
+            Gate::Probe => {
+                // The cooldown has expired, but that is true for every worker
+                // holding a delivery to this endpoint. Exactly one may go — a
+                // server that has just come back after an hour down, met by the
+                // whole backlog at once, is very likely to fall over again, and
+                // the breaker would reopen with a longer cooldown. The outage
+                // would extend itself.
+                //
+                // The database picks the winner; the losers wait for the probe's
+                // deadline like any other blocked delivery.
+                if self
+                    .store
+                    .claim_probe(p.endpoint_id, PROBE_DEADLINE)
+                    .await?
+                {
+                    self.probes.fetch_add(1, Ordering::Relaxed);
+                    relay_metrics::probe_issued();
+                    tracing::info!(gate = "breaker", "probing a recovering endpoint");
+                    Ok(Gated::Go {
+                        reserved,
+                        probing: true,
+                    })
+                } else {
+                    // Briefly, not until the probe's deadline. The deadline
+                    // governs when a *new* probe may be claimed if this one
+                    // never reports; it is not how long everybody else should
+                    // wait. A probe resolves within one request timeout, and if
+                    // it succeeds the breaker is closed by then — deferring the
+                    // backlog for the full deadline would leave a recovered
+                    // endpoint idle while its deliveries sat waiting on a
+                    // question that had already been answered.
+                    tracing::debug!(gate = "breaker", "held: another worker is probing");
+                    Ok(Gated::ProbeInFlight)
                 }
-                Gate::ProbeInFlight => return self.defer_probe_in_flight(p).await,
-                Gate::Blocked { until } => return self.defer_open_breaker(p, until).await,
+            }
+            Gate::ProbeInFlight => {
+                tracing::debug!(gate = "breaker", "held: another worker is probing");
+                Ok(Gated::ProbeInFlight)
+            }
+            Gate::Blocked { until } => {
+                tracing::debug!(gate = "breaker", %until, "held: breaker is open");
+                Ok(Gated::BreakerOpen { until })
             }
         }
+    }
+
+    /// Send a delivery that has *already* been claimed, and record the outcome.
+    ///
+    /// Separate from [`Sender::deliver`] because the worker pool claims a whole
+    /// batch in one query and then fans the rows out. Calling this with an
+    /// unclaimed row would reintroduce the duplicate-send bug, so the only callers
+    /// are ones that have just claimed it.
+    pub async fn deliver_claimed(&self, p: PendingDelivery) -> Result<Outcome, SendError> {
+        let delivery = tracing::Span::current();
+
+        let (reserved, probing) = match self
+            .gate(&p)
+            .instrument(tracing::debug_span!("gate"))
+            .await?
+        {
+            Gated::Go { reserved, probing } => (reserved, probing),
+            // Every one of these returns the reservation on the way out: `Gated`
+            // carries it only on the path that goes on to use it.
+            Gated::Busy => return self.defer_busy(p).await,
+            Gated::RateLimited { after } => return self.defer(p, after).await,
+            Gated::BreakerOpen { until } => return self.defer_open_breaker(p, until).await,
+            Gated::ProbeInFlight => return self.defer_probe_in_flight(p).await,
+        };
 
         // A refused destination is permanent — no amount of retrying makes an
         // internal address public — and nothing about the refusal is written back to
@@ -640,6 +691,10 @@ impl Sender {
             relay_domain::signature::sign(p.secret.as_bytes(), timestamp, &p.raw_payload);
 
         let started = Instant::now();
+        // The one span that covers time spent on somebody else's server. Everything
+        // else in a delivery is microseconds; if a delivery took ten seconds, it was
+        // this.
+        let send = tracing::info_span!("send", url = %p.url, status = tracing::field::Empty);
         let result = self
             .client
             .post(&p.url)
@@ -654,6 +709,7 @@ impl Sender {
             .header("relay-event-type", &p.event_type)
             .body(p.raw_payload.clone())
             .send()
+            .instrument(send.clone())
             .await;
 
         let took = started.elapsed();
@@ -662,6 +718,7 @@ impl Sender {
         let (outcome, http_status, error, snippet, retry_after, transport) = match result {
             Ok(resp) => {
                 let status = resp.status().as_u16();
+                send.record("status", status);
                 let class = classify_status(status);
                 // Read before consuming the response body. An endpoint under a rate
                 // limit knows exactly when its window resets, which is better
@@ -747,8 +804,10 @@ impl Sender {
                 snippet.as_deref(),
                 &self.worker_id,
             )
+            .instrument(tracing::debug_span!("persist", outcome = recorded.as_str()))
             .await?;
 
+        delivery.record("outcome", recorded.as_str());
         relay_metrics::attempt(recorded.as_str());
         relay_metrics::sent(took);
         if let Some(reason) = result.dead_reason() {
@@ -809,6 +868,20 @@ impl Sender {
 
         Ok(outcome)
     }
+}
+
+/// What the gates decided, and — on the one path that proceeds — the reservation
+/// they took out.
+///
+/// The reservation travels in the `Go` variant rather than being taken by the
+/// caller afterwards, so it is impossible to end up holding a slot on a path that
+/// puts the delivery back. Every other variant drops it as it is constructed.
+enum Gated {
+    Go { reserved: Reserved, probing: bool },
+    Busy,
+    RateLimited { after: Duration },
+    BreakerOpen { until: DateTime<Utc> },
+    ProbeInFlight,
 }
 
 /// What the breaker says about one delivery.
@@ -1108,10 +1181,20 @@ impl Pool {
         }
     }
 
+    /// Which process this pool's claims are stamped with.
+    fn worker_id(&self) -> &str {
+        &self.sender.worker_id
+    }
+
     /// Claim what there is room for and spawn a task per delivery.
     ///
     /// Returns the number claimed, or `None` when every worker is busy — the
     /// caller must then wait for capacity rather than spinning on the database.
+    #[tracing::instrument(
+        name = "batch",
+        skip_all,
+        fields(worker = %self.worker_id(), claimed = tracing::field::Empty)
+    )]
     async fn claim_and_spawn(
         &self,
         tasks: &mut JoinSet<()>,
@@ -1134,8 +1217,10 @@ impl Pool {
             .sender
             .store
             .claim_batch(want as i64, &self.sender.worker_id)
+            .instrument(tracing::debug_span!("claim", want))
             .await?;
         let claimed = batch.len();
+        tracing::Span::current().record("claimed", claimed);
 
         for pending in batch {
             // Shutdown can land between claiming a batch and handing it out. Those
@@ -1158,17 +1243,37 @@ impl Pool {
                 .await
                 .expect("semaphore is never closed");
             let sender = self.sender.clone();
-            tasks.spawn(async move {
-                let _permit = permit;
-                let id = pending.delivery_id;
-                match sender.deliver_claimed(pending).await {
-                    Ok(outcome) => tracing::info!(delivery_id = %id, ?outcome, "delivered"),
-                    // The row stays `inflight`, which is exactly right: it must not
-                    // be resent while the outcome is unknown. The reaper returns it
-                    // once the lease expires.
-                    Err(e) => tracing::error!(delivery_id = %id, error = %e, "delivery failed"),
+            // Built here, inside the batch span, so it is parented to the claim that
+            // produced it — and then attached to the task explicitly.
+            //
+            // This is the part that does not happen on its own. A span is ambient to
+            // the current thread, and `spawn` hands the future to whichever worker
+            // thread is free, where the ambient span is something else entirely. A
+            // task spawned without `.instrument()` is silently orphaned: its events
+            // still appear, with no delivery id and no parent, and reconstructing
+            // which of five hundred concurrent deliveries they belonged to is not
+            // possible after the fact.
+            let span = tracing::info_span!(
+                "delivery",
+                delivery_id = %pending.delivery_id,
+                endpoint_id = %pending.endpoint_id,
+                event_type = %pending.event_type,
+                attempt = pending.attempt,
+                outcome = tracing::field::Empty,
+            );
+            tasks.spawn(
+                async move {
+                    let _permit = permit;
+                    match sender.deliver_claimed(pending).await {
+                        Ok(outcome) => tracing::info!(?outcome, "delivered"),
+                        // The row stays `inflight`, which is exactly right: it must
+                        // not be resent while the outcome is unknown. The reaper
+                        // returns it once the lease expires.
+                        Err(e) => tracing::error!(error = %e, "delivery failed"),
+                    }
                 }
-            });
+                .instrument(span),
+            );
         }
 
         Ok(Some(claimed))
