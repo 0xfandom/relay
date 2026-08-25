@@ -778,22 +778,42 @@ impl Store {
         Ok(next.breaker.state)
     }
 
-    /// Move an open breaker whose cooldown has expired to half-open.
+    /// Claim the right to probe a recovering endpoint. At most one caller wins.
     ///
-    /// Deliberately unconditional for now: several workers arriving at once will all
-    /// see the cooldown expired and all be let through, which rushes an endpoint that
-    /// has only just come back. #20 replaces this with a single conditional
-    /// `UPDATE ... RETURNING` so the database picks one winner.
-    pub async fn set_breaker_half_open(&self, endpoint_id: Uuid) -> Result<()> {
-        sqlx::query(
+    /// The whole mechanism is one conditional `UPDATE ... RETURNING`, and it has to
+    /// be. A read followed by a write races: every worker in the pool reads
+    /// `open` with an expired cooldown, every one of them decides it is the prober,
+    /// and a server that has just come back after an hour down is met by the entire
+    /// backlog at once — which is very likely to knock it over again, at which point
+    /// the breaker reopens and the outage extends itself.
+    ///
+    /// A single statement cannot race. Postgres takes a row lock for its duration, so
+    /// the second caller's `WHERE breaker_state = 'open'` is evaluated against the
+    /// first caller's committed write and matches nothing. The database decides the
+    /// winner; no application code has to.
+    ///
+    /// `probe_deadline` is how long the winner has to report back. It is written into
+    /// `breaker_probe_at` so a probe that never returns — the endpoint accepts
+    /// connections and then hangs — does not leave the breaker half-open forever with
+    /// nobody allowed to try again. Missing that is how a breaker becomes a permanent
+    /// outage.
+    ///
+    /// Returns true if this caller is the prober.
+    pub async fn claim_probe(&self, endpoint_id: Uuid, probe_deadline: Duration) -> Result<bool> {
+        let won: Option<Uuid> = sqlx::query_scalar(
             "UPDATE endpoints
-             SET breaker_state = 'half_open'
-             WHERE id = $1 AND breaker_state = 'open' AND breaker_probe_at <= now()",
+             SET breaker_state = 'half_open',
+                 breaker_probe_at = now() + make_interval(secs => $2)
+             WHERE id = $1
+               AND breaker_state = 'open'
+               AND breaker_probe_at <= now()
+             RETURNING id",
         )
         .bind(endpoint_id)
-        .execute(&self.pool)
+        .bind(probe_deadline.as_secs_f64())
+        .fetch_optional(&self.pool)
         .await?;
-        Ok(())
+        Ok(won.is_some())
     }
 
     /// Force a breaker back to closed. For tests and for an operator who knows the
