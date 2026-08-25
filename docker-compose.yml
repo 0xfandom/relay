@@ -16,5 +16,49 @@ services:
       timeout: 3s
       retries: 15
 
+  # Scrapes both Relay processes and keeps a day of history. Long enough to look
+  # back at a chaos scenario over lunch, short enough that nobody has to think about
+  # disk on a laptop.
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    container_name: relay-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=24h
+    volumes:
+      - ./ops/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - relay-prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    # Relay runs on the host with `cargo run`, not in this file: giving it a
+    # container would mean rebuilding an image on every edit to watch a graph move.
+    # Docker Desktop resolves `host.docker.internal` on its own; this alias is what
+    # makes the same config work on Linux.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  grafana:
+    image: grafana/grafana:11.5.2
+    container_name: relay-grafana
+    depends_on:
+      - prometheus
+    environment:
+      # No login. The acceptance criterion for the dashboard is that it loads with
+      # no manual configuration, and a password prompt is manual configuration. This
+      # is a development compose file bound to localhost; it would be indefensible
+      # anywhere else.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      # Land on the dashboard rather than on Grafana's welcome page.
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/relay.json
+      GF_USERS_DEFAULT_THEME: dark
+    volumes:
+      - ./ops/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./ops/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+
 volumes:
   relay-pgdata:
+  relay-prometheus-data:

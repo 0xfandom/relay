@@ -1,0 +1,32 @@
+# Prometheus for local development.
+#
+# Both Relay processes are scraped, because both export and they export different
+# things: the API reports what it does to a request, the dispatcher reports the
+# queue and the send path. They are separate targets with separate `instance`
+# labels, which is the ordinary shape for a service made of more than one process.
+#
+# The targets are on the host rather than in this compose file. Relay itself runs
+# with `cargo run` during development, and giving it a container here would mean
+# rebuilding an image on every edit to watch a graph move. `host.docker.internal`
+# is resolved by Docker Desktop and, on Linux, by the `host-gateway` alias set in
+# the compose file.
+
+global:
+  # Fast for a laptop, not for production. The point of a short interval here is
+  # that a chaos scenario run by hand — kill a worker, break an endpoint — should
+  # show up on the dashboard while you are still looking at it.
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: relay-dispatcher
+    static_configs:
+      - targets: ["host.docker.internal:9091"]
+        labels:
+          component: dispatcher
+
+  - job_name: relay-api
+    static_configs:
+      - targets: ["host.docker.internal:8080"]
+        labels:
+          component: api
