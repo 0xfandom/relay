@@ -388,6 +388,34 @@ ever carry. Without that a counter that has never fired is simply absent from th
 scrape, and an empty panel reads exactly like a broken exporter — so the healthiest
 possible state would be indistinguishable from no data at all.
 
+## Reading the logs
+
+Both binaries emit JSON when their stderr is a pipe and human-readable text when it
+is a terminal. Nobody has to remember a flag: a container's stderr goes to a log
+collector that wants JSON, a developer's goes to a terminal where JSON is
+unreadable, and getting it wrong by default means either production logs that cannot
+be queried or a local run that cannot be read. `RELAY_LOG_FORMAT=json|text` forces
+it when the guess is wrong.
+
+Every delivery opens one span carrying its id, its endpoint, its event type and its
+attempt number, with four stages inside it — `gate`, `send`, `persist`, and the
+`batch` claim that produced it. The span records how the delivery ended, so "what
+happened to this one" is a single line rather than a join across several. Spans
+close with the time they were busy, which is what turns *the delivery took nine
+seconds* into *eight of them were inside `send`*. The noisy stages are `debug_span!`
+and cost nothing at the default level.
+
+The worker pool attaches each delivery's span to the spawned task explicitly. This
+is the part that does not happen on its own: a span is ambient to the current
+thread, `spawn` hands the future to whichever thread is free, and a task spawned
+without it is silently orphaned — its events still appear, with no delivery id and
+no parent, and nothing afterwards can say which delivery they described.
+
+Signing secrets cannot reach the logs. `Debug` is written by hand for every row that
+carries one and prints `<redacted>`, so a `?pending` added in a hurry during an
+incident cannot leak one — and a field added to those rows later is redacted by
+default rather than exposed by default.
+
 ## License
 
 MIT
