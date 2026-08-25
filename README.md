@@ -56,7 +56,7 @@ crates/
 Requires a recent stable Rust toolchain.
 
 ```bash
-docker compose up -d       # Postgres on 5433
+docker compose up -d       # Postgres on 5433, Prometheus on 9090, Grafana on 3000
 export DATABASE_URL=postgres://relay:relay@localhost:5433/relay
 cargo test                 # unit tests plus end-to-end against a real database
 ```
@@ -74,7 +74,7 @@ export DATABASE_URL=postgres://relay:relay@localhost:5433/relay
 # The receiver below runs on loopback, which the dispatcher refuses by default.
 export RELAY_ALLOW_PRIVATE_ENDPOINTS=true
 
-RELAY_TESTKIT_SECRET=whsec_demo cargo run -p relay-testkit   # :9090
+RELAY_TESTKIT_SECRET=whsec_demo cargo run -p relay-testkit   # :9099
 cargo run -p relay-api                                       # :8080
 cargo run -p relay-dispatcher
 ```
@@ -84,7 +84,7 @@ Register an endpoint and send it an event:
 ```bash
 curl -X POST 127.0.0.1:8080/v1/endpoints \
   -H 'content-type: application/json' \
-  -d '{"url":"http://127.0.0.1:9090/verify","event_types":["order.paid"]}'
+  -d '{"url":"http://127.0.0.1:9099/verify","event_types":["order.paid"]}'
 
 curl -X POST 127.0.0.1:8080/v1/events \
   -H 'content-type: application/json' \
@@ -387,6 +387,44 @@ Every counter is reported at zero on startup, including every label value it can
 ever carry. Without that a counter that has never fired is simply absent from the
 scrape, and an empty panel reads exactly like a broken exporter — so the healthiest
 possible state would be indistinguishable from no data at all.
+
+## The dashboard
+
+```bash
+docker compose up -d      # Postgres, Prometheus, Grafana
+cargo run -p relay-api &
+cargo run -p relay-dispatcher &
+open http://localhost:3000
+```
+
+That is the whole setup. The datasource and the dashboard are provisioned from
+`ops/`, anonymous access is on, and Grafana opens straight onto the dashboard —
+a login prompt is manual configuration, which is the thing this is meant not to
+need. Prometheus scrapes both Relay processes on the host rather than running them
+in containers, because rebuilding an image on every edit to watch a graph move is
+not a development loop.
+
+The panels are grouped by the failure mode they make visible, so a chaos scenario
+run by hand is identifiable from the dashboard alone:
+
+| Row | Reads |
+| --- | --- |
+| Is Relay healthy | Oldest pending age, due now, dead letters, endpoints cut off |
+| Back-pressure (M5) | Deferrals split by which gate held them, delivery latency |
+| Retries and dead letters (M3) | Failures by class, deaths by reason |
+| Breakers (M6) | Endpoints by state, trips against probes that recovered |
+| Workers (M2) | In flight, and deliveries rescued from dead workers |
+| Ingest (M4) | Accepted against replayed, ingest latency against delivery latency |
+
+Two panels are there to be read as negatives. *Deliveries rescued from dead
+workers* should be flat at zero — any slope at all is a report that something
+upstream is crashing, and nowhere else shows it. *Ingest latency against delivery
+latency* should be two unrelated lines: if ingest ever starts tracking delivery,
+the two paths have become coupled and the API has inherited a customer's outage.
+
+The dashboard is read-only in the UI. One edited in Grafana and not written back to
+the repository disappears the next time the container is recreated, which is worse
+than not being able to edit it.
 
 ## Asking what happened to an event
 
