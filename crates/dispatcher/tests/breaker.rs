@@ -405,3 +405,217 @@ async fn an_operator_can_reset_a_breaker(pool: PgPool) {
     assert_eq!(b.breaker_trips, 0);
     assert!(b.breaker_probe_at.is_none());
 }
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn exactly_one_worker_probes_per_cooldown(pool: PgPool) {
+    let store = Store::from_pool(pool);
+    let receiver = Receiver::new("whsec_breaker_test");
+    let (endpoint, ids) = seed(&store, &receiver, "/always500", 4).await;
+
+    // Trip it.
+    let sender = Sender::with_config(store.clone(), config(Some(policy())));
+    for id in ids.iter().take(3) {
+        sender.deliver_by_id(*id).await.expect("deliver");
+    }
+    assert_eq!(state(&store, endpoint).await, "open");
+
+    // Wait the cooldown out, then have twenty workers arrive together. A read
+    // followed by a write would let every one of them see `open` with an expired
+    // cooldown and every one decide it is the prober — and a server that has just
+    // come back after an hour down, met by its whole backlog at once, is very likely
+    // to fall over again.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..20 {
+        let store = store.clone();
+        tasks.spawn(async move { store.claim_probe(endpoint, Duration::from_secs(20)).await });
+    }
+
+    let mut winners = 0;
+    while let Some(joined) = tasks.join_next().await {
+        if joined.expect("task did not panic").expect("claim") {
+            winners += 1;
+        }
+    }
+
+    assert_eq!(
+        winners, 1,
+        "{winners} workers were told they were the prober"
+    );
+    assert_eq!(state(&store, endpoint).await, "half_open");
+}
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn a_probe_that_never_reports_does_not_block_the_next_one(pool: PgPool) {
+    let store = Store::from_pool(pool);
+    let receiver = Receiver::new("whsec_breaker_test");
+    let (endpoint, ids) = seed(&store, &receiver, "/always500", 4).await;
+
+    let sender = Sender::with_config(store.clone(), config(Some(policy())));
+    for id in ids.iter().take(3) {
+        sender.deliver_by_id(*id).await.expect("deliver");
+    }
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // A probe is claimed and then the worker dies without reporting. Without a
+    // deadline on the half-open state the breaker would sit there forever with
+    // nobody allowed to try again — a permanent outage produced by the thing meant
+    // to end one.
+    assert!(
+        store
+            .claim_probe(endpoint, Duration::from_millis(200))
+            .await
+            .expect("claim")
+    );
+    // A second claim while the first is still live is refused.
+    assert!(
+        !store
+            .claim_probe(endpoint, Duration::from_millis(200))
+            .await
+            .expect("claim"),
+        "two probes were live at once"
+    );
+
+    // The deadline passes. Note it takes an `open` breaker to reclaim, which is what
+    // the recovery path below produces; here the deadline alone must at least not
+    // leave the endpoint permanently unreachable, so a delivery is admitted again.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let claimed = store.pending_delivery_by_id(ids[3]).await.unwrap().unwrap();
+    assert_eq!(claimed.breaker_state, "half_open");
+    assert!(
+        claimed
+            .breaker_probe_at
+            .is_some_and(|at| at <= chrono::Utc::now()),
+        "the probe deadline never expired"
+    );
+}
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn a_failed_probe_extends_the_cooldown(pool: PgPool) {
+    let store = Store::from_pool(pool);
+    let receiver = Receiver::new("whsec_breaker_test");
+    let (endpoint, ids) = seed(&store, &receiver, "/always500", 12).await;
+
+    let sender = Sender::with_config(store.clone(), config(Some(policy())));
+    for id in ids.iter().take(3) {
+        sender.deliver_by_id(*id).await.expect("deliver");
+    }
+    let first = store.endpoint_breaker(endpoint).await.unwrap();
+    assert_eq!(first.breaker_trips, 1);
+
+    // Probe, fail, probe, fail. An endpoint that has failed its last probe is
+    // unlikely to pass the next one a moment later, and every probe against a dead
+    // server costs a worker a full request timeout.
+    for expected_trips in 2..=3 {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        for id in &ids {
+            let outcome = sender.deliver_by_id(*id).await.expect("deliver");
+            if matches!(outcome, Some(Outcome::Failed { .. })) {
+                break;
+            }
+        }
+        let b = store.endpoint_breaker(endpoint).await.unwrap();
+        assert_eq!(b.breaker_state, "open");
+        assert_eq!(
+            b.breaker_trips, expected_trips,
+            "a failed probe did not count as a trip"
+        );
+    }
+
+    assert!(
+        sender.probes() >= 2,
+        "only {} probes issued",
+        sender.probes()
+    );
+    assert_eq!(
+        sender.probes_recovered(),
+        0,
+        "a probe against a dead endpoint reported a recovery"
+    );
+}
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn a_successful_probe_restores_normal_delivery(pool: PgPool) {
+    let store = Store::from_pool(pool);
+    let receiver = Receiver::new("whsec_breaker_test");
+    let (endpoint, ids) = seed(&store, &receiver, "/toggle", 10).await;
+
+    let sender = Pool::with_config(store.clone(), pool_config(), config(Some(policy())));
+    for _ in 0..8 {
+        sender.run_once().await.expect("run");
+    }
+    assert_eq!(state(&store, endpoint).await, "open");
+    let hits_while_down = receiver.hits();
+
+    receiver.set_failing(false);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // One probe gets through, it works, and the rest follow.
+    for _ in 0..60 {
+        sender.run_once().await.expect("run");
+        let all = {
+            let mut done = true;
+            for id in &ids {
+                done &= store.get_delivery(*id).await.unwrap().unwrap().status == "succeeded";
+            }
+            done
+        };
+        if all {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert_eq!(state(&store, endpoint).await, "closed");
+    for id in &ids {
+        assert_eq!(
+            store.get_delivery(*id).await.unwrap().unwrap().status,
+            "succeeded"
+        );
+    }
+
+    // And the recovery was gradual rather than the whole backlog arriving at once
+    // the instant the cooldown expired.
+    assert!(
+        receiver.hits() > hits_while_down,
+        "nothing was delivered after recovery"
+    );
+
+    let b = store.endpoint_breaker(endpoint).await.unwrap();
+    // Cleared, so the next outage starts at the shortest cooldown rather than
+    // inheriting this one's.
+    assert_eq!(b.breaker_trips, 0);
+    assert_eq!(b.consecutive_failures, 0);
+    assert!(b.breaker_probe_at.is_none());
+}
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn the_pool_does_not_rush_a_recovering_endpoint(pool: PgPool) {
+    let store = Store::from_pool(pool);
+    let receiver = Receiver::new("whsec_breaker_test");
+    // Thirty deliveries queued against an endpoint that is down. When the cooldown
+    // expires all thirty are due at once.
+    let (endpoint, _) = seed(&store, &receiver, "/toggle", 30).await;
+
+    let sender = Pool::with_config(store.clone(), pool_config(), config(Some(policy())));
+    for _ in 0..8 {
+        sender.run_once().await.expect("run");
+    }
+    assert_eq!(state(&store, endpoint).await, "open");
+
+    let before = receiver.hits();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // The endpoint is still down, so the probe fails and the breaker reopens. What
+    // must not happen is thirty requests landing on it in that window.
+    for _ in 0..5 {
+        sender.run_once().await.expect("run");
+    }
+
+    let during = receiver.hits() - before;
+    assert!(
+        during <= 2,
+        "{during} requests reached a recovering endpoint on one cooldown expiry"
+    );
+}
