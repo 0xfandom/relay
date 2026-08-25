@@ -78,6 +78,28 @@ pub struct Attempt {
     pub at: DateTime<Utc>,
 }
 
+/// One row of an endpoint's delivery history.
+///
+/// The event type and the timestamps are joined in because the first question about
+/// a listed delivery is always "what was it, and when" — and answering that from a
+/// bare id means a query per row, which is how a page of a hundred becomes a
+/// hundred and one round trips.
+#[derive(Debug, Clone, FromRow, Serialize)]
+pub struct DeliverySummary {
+    pub id: Uuid,
+    pub event_id: Uuid,
+    pub endpoint_id: Uuid,
+    pub event_type: String,
+    pub status: String,
+    pub attempt: i32,
+    pub generation: i32,
+    pub dead_reason: Option<String>,
+    /// When this delivery will next be tried. In the past for a delivery that is
+    /// due, and meaningless once it has succeeded or died.
+    pub next_attempt_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+}
+
 /// A delivery joined with everything the sender needs to build one request, so
 /// the send path performs a single query rather than three.
 #[derive(Clone, FromRow)]

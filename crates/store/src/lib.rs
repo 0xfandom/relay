@@ -20,7 +20,9 @@ use uuid::Uuid;
 
 pub mod models;
 
-pub use models::{Attempt, BreakerRow, DeadLetter, Delivery, Endpoint, PendingDelivery};
+pub use models::{
+    Attempt, BreakerRow, DeadLetter, Delivery, DeliverySummary, Endpoint, PendingDelivery,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -76,6 +78,34 @@ macro_rules! claim_candidates_sql {
 /// The claim's candidate selection, wrapped in `EXPLAIN`. Exposed for the test that
 /// asserts the partial index is reachable.
 pub const EXPLAIN_CLAIM_CANDIDATES_SQL: &str = concat!("EXPLAIN ", claim_candidates_sql!());
+
+/// One page of an endpoint's history, newest first, resuming from `($3, $4)`.
+///
+/// A macro for the same reason the claim's is: the test that asks Postgres to
+/// `EXPLAIN` this has to explain the query that actually runs. A hand-copied
+/// lookalike keeps its index scan while the real query quietly loses one.
+macro_rules! delivery_page_sql {
+    () => {
+        "SELECT d.id, d.event_id, d.endpoint_id, e.event_type, d.status, d.attempt,
+                d.generation, d.dead_reason, d.next_attempt_at, d.created_at
+         FROM deliveries d
+         JOIN events e ON e.id = d.event_id
+         WHERE d.endpoint_id = $1
+           AND ($2::text IS NULL OR d.status = $2)
+           -- A row comparison, not two ANDed comparisons. `(a, b) < (c, d)` is
+           -- lexicographic in one operation, which is what lets the planner turn it
+           -- into a seek on the matching index; spelling it out as
+           -- `a < c OR (a = c AND b < d)` produces the same rows and a scan.
+           AND ($3::timestamptz IS NULL
+                OR (d.created_at, d.id) < ($3::timestamptz, $4::uuid))
+         ORDER BY d.created_at DESC, d.id DESC
+         LIMIT $5"
+    };
+}
+
+/// The history page, wrapped in `EXPLAIN`. Exposed for the test that asserts paging
+/// is a seek rather than a scan.
+pub const EXPLAIN_DELIVERY_PAGE_SQL: &str = concat!("EXPLAIN ", delivery_page_sql!());
 
 const CLAIM_BATCH_SQL: &str = concat!(
     "WITH claimed AS (
@@ -969,6 +999,74 @@ impl Store {
         Ok(n)
     }
 
+    /// One page of an endpoint's delivery history, newest first.
+    ///
+    /// Paged by position rather than by `OFFSET`, and that is the whole design.
+    /// `OFFSET n` makes the database walk and discard `n` rows before returning
+    /// anything, so page one is instant and page four hundred reads forty thousand
+    /// rows to produce a hundred — on the largest table in the system, whose whole
+    /// purpose is to keep growing. Worse, it is *wrong* under concurrent writes: a
+    /// delivery created between two requests shifts every later row down by one, and
+    /// the reader sees a row twice while never seeing another at all.
+    ///
+    /// Carrying the last row's `(created_at, id)` forward instead makes every page
+    /// an index seek to a known position, so page four hundred costs what page one
+    /// does and a concurrent insert cannot move it.
+    ///
+    /// The tiebreak on `id` is load-bearing. A fan-out writes every delivery for one
+    /// event in a single transaction, so `created_at` is emphatically not unique,
+    /// and paging on a non-unique key skips and repeats rows at every boundary.
+    ///
+    /// Scoped to one endpoint, which is Relay's ownership boundary today. When
+    /// tenants land, the tenant predicate belongs in this `WHERE` clause beside the
+    /// endpoint — not in the handler, where a route added later would forget it.
+    pub async fn deliveries_for_endpoint(
+        &self,
+        endpoint_id: Uuid,
+        status: Option<DeliveryStatus>,
+        after: Option<Cursor>,
+        limit: i64,
+    ) -> Result<Vec<DeliverySummary>> {
+        let rows = sqlx::query_as::<_, DeliverySummary>(delivery_page_sql!())
+            .bind(endpoint_id)
+            .bind(status.map(|s| s.as_str()))
+            .bind(after.map(|c| c.created_at))
+            .bind(after.map(|c| c.id))
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows)
+    }
+
+    /// One delivery with the context needed to read it, or `None`.
+    pub async fn delivery_summary(&self, id: Uuid) -> Result<Option<DeliverySummary>> {
+        let row = sqlx::query_as::<_, DeliverySummary>(
+            "SELECT d.id, d.event_id, d.endpoint_id, e.event_type, d.status, d.attempt,
+                    d.generation, d.dead_reason, d.next_attempt_at, d.created_at
+             FROM deliveries d
+             JOIN events e ON e.id = d.event_id
+             WHERE d.id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Whether an endpoint exists.
+    ///
+    /// Asked before listing its deliveries so that an unknown id is a `404` rather
+    /// than an empty page. The two are very different answers — "this endpoint has
+    /// never had a failure" is reassuring, and it is the wrong thing to tell someone
+    /// who has pasted the wrong id.
+    pub async fn endpoint_exists(&self, id: Uuid) -> Result<bool> {
+        let found: Option<Uuid> = sqlx::query_scalar("SELECT id FROM endpoints WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(found.is_some())
+    }
+
     /// A snapshot of the queue, for the metrics endpoint.
     ///
     /// One statement rather than four round trips, and — more importantly — one
@@ -1022,6 +1120,17 @@ impl Store {
         .await?;
         Ok(row)
     }
+}
+
+/// Where the previous page stopped.
+///
+/// Both halves are required. `created_at` alone is not a position: a fan-out writes
+/// every delivery for one event in the same transaction, so many rows share it, and
+/// resuming from a timestamp either repeats the whole group or skips it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cursor {
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub id: Uuid,
 }
 
 /// What one recorded attempt did to an endpoint's breaker.
@@ -1090,6 +1199,11 @@ pub struct Ingested {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryStatus {
     Pending,
+    /// Claimed by a worker and not yet resolved. Never written by
+    /// [`Store::finish_attempt`] — only the claim produces it — but it is one of the
+    /// four values the column can hold, so a history filter has to be able to name
+    /// it.
+    Inflight,
     Succeeded,
     Dead,
 }
@@ -1098,8 +1212,25 @@ impl DeliveryStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
+            Self::Inflight => "inflight",
             Self::Succeeded => "succeeded",
             Self::Dead => "dead",
+        }
+    }
+
+    /// Parse a caller-supplied filter.
+    ///
+    /// Rejected here rather than interpolated into the query, so an unknown status
+    /// is a `400` naming the four valid values instead of an empty page that looks
+    /// exactly like "this endpoint has no failures" — the most reassuring possible
+    /// answer to give someone who has just typoed `failed`.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "pending" => Some(Self::Pending),
+            "inflight" => Some(Self::Inflight),
+            "succeeded" => Some(Self::Succeeded),
+            "dead" => Some(Self::Dead),
+            _ => None,
         }
     }
 }
