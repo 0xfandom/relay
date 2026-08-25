@@ -363,6 +363,7 @@ impl Sender {
             )
             .await?;
 
+        relay_metrics::deferred(relay_metrics::Deferral::RateLimit);
         Ok(Outcome::Deferred { after })
     }
 
@@ -393,6 +394,7 @@ impl Sender {
             )
             .await?;
 
+        relay_metrics::deferred(relay_metrics::Deferral::ConcurrencyCap);
         Ok(Outcome::Deferred { after })
     }
 
@@ -433,6 +435,7 @@ impl Sender {
             )
             .await?;
 
+        relay_metrics::deferred(relay_metrics::Deferral::BreakerOpen);
         Ok(Outcome::Deferred { after })
     }
 
@@ -462,6 +465,7 @@ impl Sender {
             )
             .await?;
 
+        relay_metrics::deferred(relay_metrics::Deferral::ProbeInFlight);
         Ok(Outcome::Deferred { after })
     }
 
@@ -494,6 +498,13 @@ impl Sender {
             )
             .await?;
 
+        // Counted as an attempt with a permanent outcome, matching what was just
+        // written to the log, but *not* as a delivery duration: nothing was sent,
+        // and a zero in the latency histogram would drag the median of every panel
+        // that reads it towards a request that never happened.
+        relay_metrics::attempt(Disposition::Permanent.as_str());
+        relay_metrics::dead(DeadReason::PermanentFailure.as_str());
+        relay_metrics::refused();
         Ok(Outcome::Failed {
             class: Class::Permanent,
             status: None,
@@ -587,6 +598,7 @@ impl Sender {
                     {
                         probing = true;
                         self.probes.fetch_add(1, Ordering::Relaxed);
+                        relay_metrics::probe_issued();
                         tracing::info!(endpoint_id = %p.endpoint_id, delivery_id = %p.delivery_id,
                             "probing a recovering endpoint");
                     } else {
@@ -644,7 +656,8 @@ impl Sender {
             .send()
             .await;
 
-        let latency_ms = started.elapsed().as_millis() as i32;
+        let took = started.elapsed();
+        let latency_ms = took.as_millis() as i32;
 
         let (outcome, http_status, error, snippet, retry_after, transport) = match result {
             Ok(resp) => {
@@ -736,6 +749,12 @@ impl Sender {
             )
             .await?;
 
+        relay_metrics::attempt(recorded.as_str());
+        relay_metrics::sent(took);
+        if let Some(reason) = result.dead_reason() {
+            relay_metrics::dead(reason.as_str());
+        }
+
         // Fold this attempt into the endpoint's breaker. A separate write rather
         // than part of the transaction above: the delivery's own record is what must
         // never be lost, and coupling the breaker to it would mean a contended
@@ -751,24 +770,36 @@ impl Sender {
                 .record_health(p.endpoint_id, health, policy)
                 .await
             {
-                Ok(BreakerState::Open) if probing => tracing::warn!(
-                    endpoint_id = %p.endpoint_id,
-                    "probe failed: breaker reopened with a longer cooldown"
-                ),
-                Ok(BreakerState::Open) => tracing::warn!(
-                    endpoint_id = %p.endpoint_id,
-                    "breaker opened: deliveries to this endpoint are paused"
-                ),
-                // The gap between probes issued and probes that recovered is how
-                // much work is being spent on endpoints that are not coming back.
-                Ok(BreakerState::Closed) if probing => {
-                    self.probes_recovered.fetch_add(1, Ordering::Relaxed);
-                    tracing::info!(
-                        endpoint_id = %p.endpoint_id,
-                        "probe succeeded: endpoint recovered, deliveries resume"
-                    );
+                Ok(r) => {
+                    // Reported by the store rather than inferred from the state,
+                    // because an attempt that was already in flight when the breaker
+                    // opened leaves it open without having tripped it.
+                    if r.tripped {
+                        relay_metrics::breaker_tripped();
+                    }
+                    match r.state {
+                        BreakerState::Open if probing => tracing::warn!(
+                            endpoint_id = %p.endpoint_id,
+                            "probe failed: breaker reopened with a longer cooldown"
+                        ),
+                        BreakerState::Open if r.tripped => tracing::warn!(
+                            endpoint_id = %p.endpoint_id,
+                            "breaker opened: deliveries to this endpoint are paused"
+                        ),
+                        // The gap between probes issued and probes that recovered is
+                        // how much work is being spent on endpoints that are not
+                        // coming back.
+                        BreakerState::Closed if probing => {
+                            self.probes_recovered.fetch_add(1, Ordering::Relaxed);
+                            relay_metrics::probe_recovered();
+                            tracing::info!(
+                                endpoint_id = %p.endpoint_id,
+                                "probe succeeded: endpoint recovered, deliveries resume"
+                            );
+                        }
+                        _ => {}
+                    }
                 }
-                Ok(_) => {}
                 Err(e) => tracing::error!(
                     endpoint_id = %p.endpoint_id, error = %e,
                     "could not record endpoint health"
@@ -1307,6 +1338,7 @@ impl Reaper {
             .await?;
         if n > 0 {
             self.rescued.fetch_add(n, Ordering::Relaxed);
+            relay_metrics::rescued(n);
             // Warn, not info. Zero is the normal value, so any of this is a report
             // that something upstream died.
             tracing::warn!(
@@ -1391,6 +1423,7 @@ impl Pruner {
             .await?;
         if n > 0 {
             self.pruned.fetch_add(n, Ordering::Relaxed);
+            relay_metrics::keys_pruned(n);
             // Info, not warn. Unlike the reaper's count, a non-zero number here is
             // the system working.
             tracing::info!(

@@ -8,6 +8,7 @@ anyhow = "1.0.104"
 chrono = { version = "0.4.45", features = ["clock"], default-features = false }
 rand = "0.10.2"
 relay-domain = { version = "0.1.0", path = "../domain" }
+relay-metrics = { version = "0.1.0", path = "../metrics" }
 relay-store = { version = "0.1.0", path = "../store" }
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "charset"] }
 thiserror = "2.0.19"
