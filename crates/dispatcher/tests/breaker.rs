@@ -89,13 +89,32 @@ async fn seed(store: &Store, receiver: &Receiver, path: &str, n: usize) -> (Uuid
 /// Sleep until the endpoint's cooldown has expired.
 async fn wait_for_probe_time(store: &Store, endpoint: Uuid) {
     for _ in 0..200 {
-        let b = store.endpoint_breaker(endpoint).await.expect("breaker");
-        match b.breaker_probe_at {
-            Some(at) if at <= chrono::Utc::now() => return,
-            _ => tokio::time::sleep(Duration::from_millis(25)).await,
+        if probe_time_reached(store, endpoint).await {
+            return;
         }
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
     panic!("the cooldown never expired");
+}
+
+/// Whether the cooldown has expired *according to Postgres*.
+///
+/// Asked of the database rather than compared against this process's clock, and the
+/// difference is not pedantry. The probe time is stamped by `now()` inside Postgres,
+/// which runs in a container with its own clock, and every gate that acts on it —
+/// `claim_probe` above all — compares it against that same clock. A test that waits
+/// on the host clock and then asserts the database will agree is testing the drift
+/// between two containers, and it fails whenever the machine is busy enough for that
+/// drift to matter.
+async fn probe_time_reached(store: &Store, endpoint: Uuid) -> bool {
+    sqlx::query_scalar::<_, Option<bool>>(
+        "SELECT breaker_probe_at <= now() FROM endpoints WHERE id = $1",
+    )
+    .bind(endpoint)
+    .fetch_one(store.pool())
+    .await
+    .expect("probe time")
+    .unwrap_or(false)
 }
 
 async fn state(store: &Store, endpoint: Uuid) -> String {
@@ -501,9 +520,7 @@ async fn a_probe_that_never_reports_does_not_block_the_next_one(pool: PgPool) {
     let claimed = store.pending_delivery_by_id(ids[3]).await.unwrap().unwrap();
     assert_eq!(claimed.breaker_state, "half_open");
     assert!(
-        claimed
-            .breaker_probe_at
-            .is_some_and(|at| at <= chrono::Utc::now()),
+        probe_time_reached(&store, endpoint).await,
         "the probe deadline never expired"
     );
 }
