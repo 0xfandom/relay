@@ -5,6 +5,7 @@ version.workspace = true
 
 [dependencies]
 anyhow = "1.0.104"
+chrono = { version = "0.4.45", features = ["clock"], default-features = false }
 rand = "0.10.2"
 relay-domain = { version = "0.1.0", path = "../domain" }
 relay-store = { version = "0.1.0", path = "../store" }
