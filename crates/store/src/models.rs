@@ -94,4 +94,41 @@ pub struct PendingDelivery {
     /// second query to decide whether it is allowed to send yet.
     pub rate_per_second: f64,
     pub burst: f64,
+    /// The endpoint's breaker as it stood when this row was claimed.
+    ///
+    /// Read here rather than queried at send time so the gate costs nothing. It can
+    /// be stale by a few milliseconds — another worker may have tripped the breaker
+    /// in between — and that is acceptable: the cost is a handful of extra requests
+    /// to an endpoint that is already failing, against one query per delivery
+    /// forever.
+    pub breaker_state: String,
+    pub breaker_probe_at: Option<DateTime<Utc>>,
+}
+
+/// An endpoint's circuit breaker, as stored.
+#[derive(Debug, Clone, FromRow, Serialize)]
+pub struct BreakerRow {
+    /// `closed`, `open` or `half_open`.
+    pub breaker_state: String,
+    pub consecutive_failures: i32,
+    pub breaker_trips: i32,
+    /// When a probe may next be issued. `None` only while closed.
+    pub breaker_probe_at: Option<DateTime<Utc>>,
+    pub breaker_opened_at: Option<DateTime<Utc>>,
+}
+
+impl BreakerRow {
+    /// The stored row as the domain's value type.
+    ///
+    /// An unrecognised state reads as closed. That is the safe direction: the
+    /// alternative is refusing to deliver anything to an endpoint because of a typo
+    /// in a column, and the `CHECK` constraint already makes it unreachable.
+    pub fn breaker(&self) -> relay_domain::breaker::Breaker {
+        relay_domain::breaker::Breaker {
+            state: relay_domain::breaker::State::parse(&self.breaker_state)
+                .unwrap_or(relay_domain::breaker::State::Closed),
+            consecutive_failures: self.consecutive_failures.max(0) as u32,
+            trips: self.breaker_trips.max(0) as u32,
+        }
+    }
 }
