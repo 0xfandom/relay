@@ -47,6 +47,7 @@ crates/
   store/       sqlx repositories and migrations
   dispatcher/  worker pool, reaper, HTTP sender
   api/         axum ingest and admin endpoints
+  metrics/     every metric name, and the /metrics endpoint that renders them
   testkit/     configurable receiver for integration tests
 ```
 
@@ -348,6 +349,44 @@ body.
 
 `RELAY_ALLOW_PRIVATE_ENDPOINTS=true` disables the address check for local
 development. It is off by default and should stay off anywhere real.
+
+## What Relay reports about itself
+
+Five separate mechanisms can now hold a delivery back — the backoff, the endpoint
+rate limit, the global and per-endpoint concurrency caps, and the breaker — and
+from outside the process none of them was visible. Both binaries export Prometheus
+metrics; the API on its own port at `/metrics`, the dispatcher on
+`RELAY_METRICS_BIND` (default `0.0.0.0:9091`).
+
+```bash
+curl -s localhost:8080/metrics   # ingest
+curl -s localhost:9091/metrics   # queue, deliveries, breakers
+```
+
+Two scrape targets rather than one, because they are two processes. The queue
+gauges are exported by the dispatcher *only*: they describe rows in a database both
+processes share, so a second reporter would appear as a duplicate series under a
+different `instance` label and any dashboard summing across instances would report
+twice the queue that exists.
+
+The number to watch first is `relay_queue_oldest_pending_age_seconds`, not
+`relay_queue_depth`. Depth lies in both directions — it can be thousands and
+perfectly healthy while a burst drains, or three and catastrophic when those three
+have been stuck for an hour. Age only goes up when something is genuinely not
+moving. It reports `NaN` rather than `0` on an empty queue, because "nothing is
+queued" and "the oldest item is zero seconds behind" are both healthy and a panel
+that cannot tell them apart is a panel nobody checks.
+
+`relay_delivery_attempts_total` uses the same four outcome names the attempt log
+stores in `outcome_class`, so a number on a graph and a row in the database can be
+reconciled without a translation table. Deferrals are broken down separately by
+`relay_deliveries_deferred_total{reason}`: during an incident the question is never
+"how much is being deferred" but "by which gate".
+
+Every counter is reported at zero on startup, including every label value it can
+ever carry. Without that a counter that has never fired is simply absent from the
+scrape, and an empty panel reads exactly like a broken exporter — so the healthiest
+possible state would be indistinguishable from no data at all.
 
 ## License
 
