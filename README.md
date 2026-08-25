@@ -231,6 +231,22 @@ this one matters most, because charging attempts for the time an endpoint is cut
 would empty every pending delivery's retry budget during the outage and they would
 all be dead by the time it came back.
 
+**Exactly one worker probes.** When a cooldown expires it has expired for every
+worker holding a delivery to that endpoint, and a server that has just come back
+after an hour down will very likely fall over again if met by the whole backlog at
+once — at which point the breaker reopens with a longer cooldown and the outage
+extends itself. The probe is claimed with a single conditional `UPDATE ... RETURNING`
+so the database picks the winner; a read followed by a write would let every worker
+decide it was the prober.
+
+The claim also writes a deadline. A probe against an endpoint that accepts
+connections and never answers would otherwise leave the breaker half-open forever
+with nobody allowed to try again — a permanent outage produced by the thing meant to
+end one.
+
+Everyone else waits briefly rather than for that deadline, because a probe settles
+the question within one request timeout and whichever way it goes they want to know.
+
 Cooldowns double per consecutive trip and cap at five minutes.
 `RELAY_BREAKER_THRESHOLD`, `RELAY_BREAKER_COOLDOWN_SECS` and
 `RELAY_BREAKER_MAX_COOLDOWN_SECS` configure it; `RELAY_BREAKER=false` disables it.
