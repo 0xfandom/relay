@@ -6,6 +6,7 @@ version.workspace = true
 [dependencies]
 anyhow = "1.0.104"
 axum = "0.8.9"
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 hex = "0.4.3"
 rand = "0.10.2"
 relay-domain = { version = "0.1.0", path = "../domain" }
