@@ -8,7 +8,7 @@ use serde::Serialize;
 use sqlx::FromRow;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, FromRow, Serialize)]
+#[derive(Clone, FromRow, Serialize)]
 pub struct Endpoint {
     pub id: Uuid,
     pub url: String,
@@ -80,7 +80,7 @@ pub struct Attempt {
 
 /// A delivery joined with everything the sender needs to build one request, so
 /// the send path performs a single query rather than three.
-#[derive(Debug, Clone, FromRow)]
+#[derive(Clone, FromRow)]
 pub struct PendingDelivery {
     pub delivery_id: Uuid,
     pub attempt: i32,
@@ -115,6 +115,51 @@ pub struct BreakerRow {
     /// When a probe may next be issued. `None` only while closed.
     pub breaker_probe_at: Option<DateTime<Utc>>,
     pub breaker_opened_at: Option<DateTime<Utc>>,
+}
+
+/// `Debug` is written out rather than derived, and the secret is redacted.
+///
+/// A structural guarantee instead of a rule people have to remember. The signing
+/// secret rides along on every claimed row because the sender needs it, which means
+/// one `?pending` in a log line — added during an incident, by someone in a hurry —
+/// would write every customer's secret into a log aggregator that is backed up,
+/// searchable and shared with people who should never see it. Rotating after that
+/// means telling every customer to change their verification key.
+///
+/// The derive cannot be trusted to stay safe: it prints whatever fields exist, so a
+/// field added later is exposed by default. This is the opposite default.
+impl std::fmt::Debug for PendingDelivery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingDelivery")
+            .field("delivery_id", &self.delivery_id)
+            .field("attempt", &self.attempt)
+            .field("event_type", &self.event_type)
+            // Length, not content. A payload is customer data and can be enormous;
+            // its size is the part that is ever useful in a log.
+            .field("raw_payload_bytes", &self.raw_payload.len())
+            .field("endpoint_id", &self.endpoint_id)
+            .field("url", &self.url)
+            .field("secret", &"<redacted>")
+            .field("rate_per_second", &self.rate_per_second)
+            .field("burst", &self.burst)
+            .field("breaker_state", &self.breaker_state)
+            .field("breaker_probe_at", &self.breaker_probe_at)
+            .finish()
+    }
+}
+
+/// Same reasoning as [`PendingDelivery`]: the secret never reaches a log by
+/// accident. `Serialize` already skips it, so this closes the other door.
+impl std::fmt::Debug for Endpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Endpoint")
+            .field("id", &self.id)
+            .field("url", &self.url)
+            .field("secret", &"<redacted>")
+            .field("event_types", &self.event_types)
+            .field("enabled", &self.enabled)
+            .finish()
+    }
 }
 
 impl BreakerRow {
