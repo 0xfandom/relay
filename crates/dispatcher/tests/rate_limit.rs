@@ -33,6 +33,10 @@ fn limited() -> SenderConfig {
         },
         policy: Policy::permissive(),
         rate_limit: true,
+        // Breaker off: several of these tests fail one endpoint repeatedly on
+        // purpose, and tripping it would replace the behaviour under test with a
+        // deferral.
+        breaker: None,
         // Wide, so the bucket is the only thing holding anything back. The
         // concurrency caps are tested in `bulkhead.rs`; here they would only muddy
         // which limit a deferral came from.
@@ -323,6 +327,10 @@ async fn switching_the_limiter_off_removes_the_ceiling(pool: PgPool) {
     // something real. Off is a deliberate load-test setting, never a default.
     let unlimited = SenderConfig {
         rate_limit: false,
+        // Breaker off: several of these tests fail one endpoint repeatedly on
+        // purpose, and tripping it would replace the behaviour under test with a
+        // deferral.
+        breaker: None,
         ..limited()
     };
     let sender = Pool::with_config(store.clone(), pool_config(), unlimited);
