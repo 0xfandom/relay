@@ -16,7 +16,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -55,6 +55,13 @@ struct Inner {
     /// same whether one is in flight or a thousand.
     in_flight: AtomicU64,
     max_in_flight: AtomicU64,
+    /// Whether `/toggle` is currently refusing.
+    ///
+    /// The other failure routes are fixed: `/always500` always fails and `/verify`
+    /// always works. Neither can express "dead for a while, then back", which is the
+    /// half of a circuit breaker that actually matters — a breaker that opens and
+    /// never closes is a permanent outage with extra steps.
+    failing: AtomicBool,
 }
 
 /// Counts a request as in flight for as long as the handler is running.
@@ -88,8 +95,14 @@ impl Receiver {
                 hits: AtomicU64::new(0),
                 in_flight: AtomicU64::new(0),
                 max_in_flight: AtomicU64::new(0),
+                failing: AtomicBool::new(true),
             }),
         }
+    }
+
+    /// Make `/toggle` fail or recover, from the test, while the sender is running.
+    pub fn set_failing(&self, failing: bool) {
+        self.inner.failing.store(failing, Ordering::SeqCst);
     }
 
     pub fn received_ids(&self) -> Vec<String> {
@@ -117,6 +130,7 @@ impl Receiver {
             .route("/flaky", post(flaky))
             .route("/429", post(too_many))
             .route("/bigbody", post(big_body))
+            .route("/toggle", post(toggle))
             .route("/received", get(received))
             .with_state(self.clone())
     }
@@ -294,6 +308,17 @@ async fn big_body(
     let _in_flight = record(&state, &headers, &body);
     let page = "x".repeat(p.kb * 1024);
     (StatusCode::INTERNAL_SERVER_ERROR, page).into_response()
+}
+
+/// Fails or succeeds according to [`Receiver::set_failing`]. Starts out failing, so
+/// a test can trip a breaker and then bring the endpoint back.
+async fn toggle(State(state): State<Receiver>, headers: HeaderMap, body: Bytes) -> Response {
+    let _in_flight = record(&state, &headers, &body);
+    if state.inner.failing.load(Ordering::SeqCst) {
+        (StatusCode::SERVICE_UNAVAILABLE, "down").into_response()
+    } else {
+        (StatusCode::OK, "ok").into_response()
+    }
 }
 
 async fn received(State(state): State<Receiver>) -> Response {
