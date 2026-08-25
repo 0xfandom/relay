@@ -10,14 +10,17 @@
 
 use std::time::Duration;
 
-use relay_domain::rate_limit::Rate;
+use relay_domain::{
+    breaker::{self, Event, Health, Policy as BreakerPolicy, State as BreakerState},
+    rate_limit::Rate,
+};
 use serde::Serialize;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use uuid::Uuid;
 
 pub mod models;
 
-pub use models::{Attempt, DeadLetter, Delivery, Endpoint, PendingDelivery};
+pub use models::{Attempt, BreakerRow, DeadLetter, Delivery, Endpoint, PendingDelivery};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -91,7 +94,9 @@ const CLAIM_BATCH_SQL: &str = concat!(
             ep.url        AS url,
             ep.secret     AS secret,
             ep.rate_per_second AS rate_per_second,
-            ep.burst      AS burst
+            ep.burst      AS burst,
+            ep.breaker_state AS breaker_state,
+            ep.breaker_probe_at AS breaker_probe_at
      FROM claimed c
      JOIN events    e  ON e.id  = c.event_id
      JOIN endpoints ep ON ep.id = c.endpoint_id"
@@ -500,7 +505,9 @@ impl Store {
                     ep.url          AS url,
                     ep.secret       AS secret,
                     ep.rate_per_second AS rate_per_second,
-                    ep.burst        AS burst
+                    ep.burst        AS burst,
+                    ep.breaker_state AS breaker_state,
+                    ep.breaker_probe_at AS breaker_probe_at
              FROM deliveries d
              JOIN events    e  ON e.id  = d.event_id
              JOIN endpoints ep ON ep.id = d.endpoint_id
@@ -527,7 +534,9 @@ impl Store {
                     ep.url          AS url,
                     ep.secret       AS secret,
                     ep.rate_per_second AS rate_per_second,
-                    ep.burst        AS burst
+                    ep.burst        AS burst,
+                    ep.breaker_state AS breaker_state,
+                    ep.breaker_probe_at AS breaker_probe_at
              FROM deliveries d
              JOIN events    e  ON e.id  = d.event_id
              JOIN endpoints ep ON ep.id = d.endpoint_id
@@ -683,6 +692,122 @@ impl Store {
         .await?;
 
         tx.commit().await?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------ breaker
+
+    /// The breaker as stored, for tests and for the admin surface M7 will want.
+    pub async fn endpoint_breaker(&self, endpoint_id: Uuid) -> Result<BreakerRow> {
+        let row = sqlx::query_as::<_, BreakerRow>(
+            "SELECT breaker_state, consecutive_failures, breaker_trips,
+                    breaker_probe_at, breaker_opened_at
+             FROM endpoints WHERE id = $1",
+        )
+        .bind(endpoint_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.ok_or(StoreError::EndpointNotFound)
+    }
+
+    /// Fold one attempt's evidence into the endpoint's breaker.
+    ///
+    /// Read and write in one transaction with the row locked, because the decision
+    /// depends on what is already there: two workers reporting a failure at the same
+    /// instant against an unlocked row would both read four consecutive failures,
+    /// both write five, and the breaker would record one failure where two happened.
+    /// At a threshold of five that is the difference between tripping and not.
+    ///
+    /// This is the reason the state lives in Postgres at all. Held in process memory
+    /// it looks correct with one worker and silently fails with several: each sees a
+    /// fraction of the failures, none reaches the threshold, and every worker
+    /// independently concludes the endpoint is merely unlucky.
+    ///
+    /// Returns the state the breaker is now in.
+    pub async fn record_health(
+        &self,
+        endpoint_id: Uuid,
+        health: Health,
+        policy: &BreakerPolicy,
+    ) -> Result<BreakerState> {
+        let mut tx = self.pool.begin().await?;
+
+        let current = sqlx::query_as::<_, BreakerRow>(
+            "SELECT breaker_state, consecutive_failures, breaker_trips,
+                    breaker_probe_at, breaker_opened_at
+             FROM endpoints WHERE id = $1
+             FOR UPDATE",
+        )
+        .bind(endpoint_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(StoreError::EndpointNotFound)?;
+
+        // The decision itself is the pure function in `relay_domain::breaker`. None
+        // of it is expressed in SQL, so the rules are tested exhaustively in
+        // microseconds and this method only has to store the answer.
+        let next = breaker::transition(current.breaker(), Event::Attempted(health), policy);
+
+        sqlx::query(
+            "UPDATE endpoints
+             SET breaker_state = $2,
+                 consecutive_failures = $3,
+                 breaker_trips = $4,
+                 breaker_probe_at = CASE
+                     WHEN $5::double precision IS NOT NULL
+                         THEN now() + make_interval(secs => $5)
+                     WHEN $2 = 'closed' THEN NULL
+                     ELSE breaker_probe_at
+                 END,
+                 breaker_opened_at = CASE
+                     WHEN $5::double precision IS NOT NULL THEN now()
+                     WHEN $2 = 'closed' THEN NULL
+                     ELSE breaker_opened_at
+                 END
+             WHERE id = $1",
+        )
+        .bind(endpoint_id)
+        .bind(next.breaker.state.as_str())
+        .bind(next.breaker.consecutive_failures as i32)
+        .bind(next.breaker.trips as i32)
+        .bind(next.cooldown.map(|d| d.as_secs_f64()))
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(next.breaker.state)
+    }
+
+    /// Move an open breaker whose cooldown has expired to half-open.
+    ///
+    /// Deliberately unconditional for now: several workers arriving at once will all
+    /// see the cooldown expired and all be let through, which rushes an endpoint that
+    /// has only just come back. #20 replaces this with a single conditional
+    /// `UPDATE ... RETURNING` so the database picks one winner.
+    pub async fn set_breaker_half_open(&self, endpoint_id: Uuid) -> Result<()> {
+        sqlx::query(
+            "UPDATE endpoints
+             SET breaker_state = 'half_open'
+             WHERE id = $1 AND breaker_state = 'open' AND breaker_probe_at <= now()",
+        )
+        .bind(endpoint_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Force a breaker back to closed. For tests and for an operator who knows the
+    /// endpoint is fine and does not want to wait out the cooldown.
+    pub async fn reset_breaker(&self, endpoint_id: Uuid) -> Result<()> {
+        sqlx::query(
+            "UPDATE endpoints
+             SET breaker_state = 'closed', consecutive_failures = 0, breaker_trips = 0,
+                 breaker_probe_at = NULL, breaker_opened_at = NULL
+             WHERE id = $1",
+        )
+        .bind(endpoint_id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
