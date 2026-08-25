@@ -9,6 +9,7 @@ axum = "0.8.9"
 hex = "0.4.3"
 rand = "0.10.2"
 relay-domain = { version = "0.1.0", path = "../domain" }
+relay-metrics = { version = "0.1.0", path = "../metrics" }
 relay-store = { version = "0.1.0", path = "../store" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
@@ -23,5 +24,6 @@ uuid = "1.24.0"
 # The concurrency test drives the real router over a real socket: 100 simultaneous
 # requests through axum's own extractors is the only way to prove that losing the
 # race never reaches the caller as a 5xx.
+relay-testkit = { path = "../testkit" }
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "charset"] }
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "postgres", "uuid", "chrono", "migrate", "macros"] }

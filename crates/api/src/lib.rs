@@ -5,10 +5,13 @@
 //! wait for any customer endpoint, because a customer endpoint may take thirty
 //! seconds or hang forever, and the caller must not inherit that latency.
 
+use std::time::Instant;
+
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{Path, Query, Request, State},
     http::{HeaderMap, HeaderName, StatusCode, header},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -30,11 +33,64 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/endpoints", post(create_endpoint))
-        .route("/v1/events", post(ingest_event))
+        .route(
+            "/v1/events",
+            // Timed from outside the handler rather than inside it, so the
+            // measurement includes the work axum does on the way in and out —
+            // reading the body, running extractors, rendering the error for a
+            // request that never reached the handler at all. A caller's stopwatch
+            // includes all of that, and a latency metric that disagrees with the
+            // caller is not measuring the thing anyone cares about.
+            post(ingest_event).layer(middleware::from_fn(measure_ingest)),
+        )
         .route("/v1/dlq", get(list_dead_letters))
         .route("/v1/dlq/replay", post(replay_many))
         .route("/v1/deliveries/{id}/replay", post(replay_one))
         .with_state(state)
+}
+
+/// Serve `/metrics` alongside the ingest API.
+///
+/// Separate from [`router`] because installing the recorder is a process-global
+/// action that can only happen once, and the tests that build a router are not
+/// entitled to assume they are the only one in the process.
+pub fn router_with_metrics(state: AppState, exporter: relay_metrics::Exporter) -> Router {
+    router(state).merge(exporter.router())
+}
+
+/// Record how long an ingest took and how it ended.
+async fn measure_ingest(req: Request, next: Next) -> Response {
+    let started = Instant::now();
+    let response = next.run(req).await;
+    relay_metrics::ingest(ingest_outcome(&response), started.elapsed());
+    response
+}
+
+/// Read the outcome off the response rather than being told it.
+///
+/// The handler has several exits — a rejection, a fresh event, a replay — and
+/// threading a metric through each of them means a new exit added later silently
+/// stops being counted. The response already carries the answer.
+fn ingest_outcome(response: &Response) -> relay_metrics::Ingest {
+    let status = response.status();
+    if status.is_server_error() {
+        // Kept apart from a rejection on purpose. A spike in rejections is a
+        // customer shipping a change; a spike in errors is us.
+        return relay_metrics::Ingest::Error;
+    }
+    if !status.is_success() {
+        return relay_metrics::Ingest::Rejected;
+    }
+    let replayed = response
+        .headers()
+        .get("relay-idempotent-replay")
+        .and_then(|v| v.to_str().ok())
+        == Some("true");
+    if replayed {
+        relay_metrics::Ingest::Replayed
+    } else {
+        relay_metrics::Ingest::Accepted
+    }
 }
 
 async fn healthz(State(state): State<AppState>) -> Response {
