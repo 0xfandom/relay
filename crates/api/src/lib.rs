@@ -17,7 +17,7 @@ use axum::{
 };
 use rand::RngExt;
 use relay_domain::{idempotency, rate_limit::Rate, url_guard::Policy};
-use relay_store::{DeadLetterFilter, DeadReason, Store};
+use relay_store::{Cursor, DeadLetterFilter, DeadReason, DeliveryStatus, Store};
 use serde::{Deserialize, Serialize};
 
 pub mod extract;
@@ -43,6 +43,8 @@ pub fn router(state: AppState) -> Router {
             // caller is not measuring the thing anyone cares about.
             post(ingest_event).layer(middleware::from_fn(measure_ingest)),
         )
+        .route("/v1/deliveries/{id}", get(get_delivery))
+        .route("/v1/endpoints/{id}/deliveries", get(list_deliveries))
         .route("/v1/dlq", get(list_dead_letters))
         .route("/v1/dlq/replay", post(replay_many))
         .route("/v1/deliveries/{id}/replay", post(replay_one))
@@ -299,6 +301,119 @@ fn event_type_from(headers: &HeaderMap, body: &[u8]) -> Option<String> {
         .get("type")?
         .as_str()
         .map(str::to_string)
+}
+
+// ------------------------------------------------------------------- history
+
+/// `GET /v1/deliveries/{id}`
+///
+/// The delivery and every attempt made on it. This is the whole point of the
+/// append-only attempt log: "what happened to my event" should be a query, not an
+/// investigation across three log aggregators.
+async fn get_delivery(
+    State(state): State<AppState>,
+    Path(id): Path<uuid::Uuid>,
+) -> Result<Response, ApiError> {
+    let Some(delivery) = state.store.delivery_summary(id).await? else {
+        return Err(ApiError::NotFound("no delivery with that id".into()));
+    };
+    // Ordered by (generation, attempt_no), so a replayed delivery reads as two runs
+    // rather than as two attempt zeroes in an ambiguous order.
+    let attempts = state.store.attempt_history(id).await?;
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({ "delivery": delivery, "attempts": attempts })),
+    )
+        .into_response())
+}
+
+#[derive(Deserialize)]
+pub struct HistoryQuery {
+    /// `pending`, `inflight`, `succeeded` or `dead`.
+    pub status: Option<String>,
+    pub limit: Option<i64>,
+    /// Opaque. It is the previous page's `next_cursor`, and nothing else.
+    pub cursor: Option<String>,
+}
+
+/// `GET /v1/endpoints/{id}/deliveries`
+///
+/// Newest first, paged by position rather than by offset. Scoped to the endpoint in
+/// the store's `WHERE` clause rather than filtered here — the scope belongs beside
+/// the query, where a route added later cannot forget it.
+async fn list_deliveries(
+    State(state): State<AppState>,
+    Path(endpoint_id): Path<uuid::Uuid>,
+    Query(q): Query<HistoryQuery>,
+) -> Result<Response, ApiError> {
+    // An unknown endpoint is a `404`, not an empty page. "This endpoint has had no
+    // failures" is the most reassuring answer there is, and it is the wrong thing to
+    // tell someone who has pasted the wrong id.
+    if !state.store.endpoint_exists(endpoint_id).await? {
+        return Err(ApiError::NotFound("no endpoint with that id".into()));
+    }
+
+    let status = match q.status.as_deref() {
+        None => None,
+        Some(s) => Some(DeliveryStatus::parse(s).ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "unknown status {s:?}, expected pending, inflight, succeeded or dead"
+            ))
+        })?),
+    };
+    let limit = q.limit.unwrap_or(DEFAULT_PAGE).clamp(1, MAX_PAGE);
+    let after = q.cursor.as_deref().map(decode_cursor).transpose()?;
+
+    let items = state
+        .store
+        .deliveries_for_endpoint(endpoint_id, status, after, limit)
+        .await?;
+
+    // Offered only on a full page. A short page cannot have more behind it, and
+    // handing back a cursor that leads to nothing invites a client to loop.
+    let next = (items.len() as i64 == limit)
+        .then(|| items.last())
+        .flatten()
+        .map(|d| {
+            encode_cursor(Cursor {
+                created_at: d.created_at,
+                id: d.id,
+            })
+        });
+
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "count": items.len(),
+            "items": items,
+            "next_cursor": next,
+        })),
+    )
+        .into_response())
+}
+
+/// A page position, as an opaque string.
+///
+/// Opaque on purpose. A cursor that reads as `created_at=...&id=...` is a cursor
+/// callers will construct by hand, and then the pair of columns it names can never
+/// change without breaking them. Hex is not encryption and is not meant to be — it
+/// is a sign that says "this is ours".
+fn encode_cursor(c: Cursor) -> String {
+    // Microseconds, because that is `timestamptz`'s own resolution. Anything finer
+    // would round on the way back and land the next page one row off.
+    hex::encode(format!("{}:{}", c.created_at.timestamp_micros(), c.id))
+}
+
+fn decode_cursor(s: &str) -> Result<Cursor, ApiError> {
+    let bad = || ApiError::BadRequest("invalid cursor".into());
+    let raw = hex::decode(s).map_err(|_| bad())?;
+    let text = String::from_utf8(raw).map_err(|_| bad())?;
+    let (micros, id) = text.split_once(':').ok_or_else(bad)?;
+    Ok(Cursor {
+        created_at: chrono::DateTime::from_timestamp_micros(micros.parse().map_err(|_| bad())?)
+            .ok_or_else(bad)?,
+        id: id.parse().map_err(|_| bad())?,
+    })
 }
 
 // --------------------------------------------------------------- dead letters
