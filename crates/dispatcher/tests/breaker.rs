@@ -86,6 +86,18 @@ async fn seed(store: &Store, receiver: &Receiver, path: &str, n: usize) -> (Uuid
     (ep.id, ids)
 }
 
+/// Sleep until the endpoint's cooldown has expired.
+async fn wait_for_probe_time(store: &Store, endpoint: Uuid) {
+    for _ in 0..200 {
+        let b = store.endpoint_breaker(endpoint).await.expect("breaker");
+        match b.breaker_probe_at {
+            Some(at) if at <= chrono::Utc::now() => return,
+            _ => tokio::time::sleep(Duration::from_millis(25)).await,
+        }
+    }
+    panic!("the cooldown never expired");
+}
+
 async fn state(store: &Store, endpoint: Uuid) -> String {
     store
         .endpoint_breaker(endpoint)
@@ -424,7 +436,7 @@ async fn exactly_one_worker_probes_per_cooldown(pool: PgPool) {
     // cooldown and every one decide it is the prober — and a server that has just
     // come back after an hour down, met by its whole backlog at once, is very likely
     // to fall over again.
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    wait_for_probe_time(&store, endpoint).await;
 
     let mut tasks = tokio::task::JoinSet::new();
     for _ in 0..20 {
@@ -456,7 +468,7 @@ async fn a_probe_that_never_reports_does_not_block_the_next_one(pool: PgPool) {
     for id in ids.iter().take(3) {
         sender.deliver_by_id(*id).await.expect("deliver");
     }
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    wait_for_probe_time(&store, endpoint).await;
 
     // A probe is claimed and then the worker dies without reporting. Without a
     // deadline on the half-open state the breaker would sit there forever with
@@ -508,7 +520,10 @@ async fn a_failed_probe_extends_the_cooldown(pool: PgPool) {
     // unlikely to pass the next one a moment later, and every probe against a dead
     // server costs a worker a full request timeout.
     for expected_trips in 2..=3 {
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        // Wait on the breaker's own probe time rather than a guessed interval — the
+        // cooldown doubles each round, so any fixed sleep is right once and wrong
+        // afterwards.
+        wait_for_probe_time(&store, endpoint).await;
         for id in &ids {
             let outcome = sender.deliver_by_id(*id).await.expect("deliver");
             if matches!(outcome, Some(Outcome::Failed { .. })) {
