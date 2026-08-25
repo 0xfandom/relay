@@ -167,3 +167,55 @@ async fn the_claim_uses_the_partial_index_rather_than_scanning(pool: PgPool) {
          once the table holds real history.\nPlan was:\n{plan}"
     );
 }
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_history_page_seeks_rather_than_scans(pool: PgPool) {
+    let store = Store::from_pool(pool);
+    let endpoint = store
+        .create_endpoint("https://example.com/hook", "whsec_history_plan", &[])
+        .await
+        .expect("endpoint");
+    for i in 0..5 {
+        store
+            .insert_event_and_fan_out("order.paid", format!(r#"{{"n":{i}}}"#).as_bytes())
+            .await
+            .expect("insert");
+    }
+
+    // Same reasoning as the claim's plan test above: Postgres is right to scan five
+    // rows, so the question asked is whether the index is *reachable*, which is what
+    // governs behaviour once this table holds a year of history.
+    let mut conn = store.pool().acquire().await.unwrap();
+    sqlx::query("ANALYZE deliveries")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    sqlx::query("SET enable_seqscan = off")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+
+    let plan: Vec<String> = sqlx::query_scalar(relay_store::EXPLAIN_DELIVERY_PAGE_SQL)
+        .bind(endpoint.id)
+        .bind(None::<String>)
+        .bind(None::<chrono::DateTime<chrono::Utc>>)
+        .bind(None::<uuid::Uuid>)
+        .bind(10i64)
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap();
+    let plan = plan.join("\n");
+
+    assert!(
+        plan.contains("deliveries_endpoint_created_id_idx"),
+        "the history page must be able to seek on (endpoint_id, created_at, id).\n\
+         Without it every page re-reads the endpoint's whole history, which is the \
+         cost `OFFSET` was avoided to escape.\nPlan was:\n{plan}"
+    );
+    // The point of paging by position: the rows come back already ordered, so the
+    // page is the first N of an index walk rather than a sort of everything.
+    assert!(
+        !plan.contains("Sort"),
+        "the page should be read in index order, not sorted.\nPlan was:\n{plan}"
+    );
+}
