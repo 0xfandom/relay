@@ -1,0 +1,15 @@
+[package]
+name = "relay-metrics"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+axum = "0.8.9"
+metrics = "0.24.6"
+# Default features off on purpose: they pull in a whole HTTP listener and a
+# push-gateway client, and Relay already has an HTTP server to hang `/metrics` off.
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
+relay-store = { version = "0.1.0", path = "../store" }
+tokio = { version = "1.53.1", features = ["net", "rt"] }
+tokio-util = "0.7.19"
+tracing = "0.1.44"
