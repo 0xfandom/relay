@@ -39,6 +39,10 @@ fn config(limits: Limits) -> SenderConfig {
         // Off: this file is about concurrency, and a token shortage would look
         // exactly like a bulkhead deferral in the results.
         rate_limit: false,
+        // Breaker off: several of these tests fail one endpoint repeatedly on
+        // purpose, and tripping it would replace the behaviour under test with a
+        // deferral.
+        breaker: None,
         limits,
     }
 }
@@ -291,6 +295,10 @@ async fn a_delivery_stopped_by_the_bulkhead_does_not_spend_a_token(pool: PgPool)
         SenderConfig {
             // On, deliberately: the point is what happens when both gates are live.
             rate_limit: true,
+            // Breaker off: several of these tests fail one endpoint repeatedly on
+            // purpose, and tripping it would replace the behaviour under test with a
+            // deferral.
+            breaker: None,
             ..config(Limits {
                 max_in_flight: 64,
                 per_endpoint: 1,

@@ -250,6 +250,10 @@ fn local() -> SenderConfig {
         // Rate limiting off: these tests are about something else, and a deferral
         // would add attempt rows for requests that were never made.
         rate_limit: false,
+        // Breaker off: several of these tests fail one endpoint repeatedly on
+        // purpose, and tripping it would replace the behaviour under test with a
+        // deferral.
+        breaker: None,
         // Same reasoning for the in-flight caps. This file asserts the *worker pool*
         // is the bound on concurrency, so the bulkhead has to be wide enough not to
         // become the bound instead — `crates/dispatcher/tests/bulkhead.rs` is where
