@@ -39,6 +39,14 @@ use uuid::Uuid;
 /// Customer error pages can be enormous. Store enough to debug with, no more.
 const SNIPPET_BYTES: usize = 2048;
 
+/// How long the winner of a probe has to report back before another may be issued.
+///
+/// Longer than one request, so a probe that is merely slow is not raced by a second.
+/// Finite, because a probe against an endpoint that accepts connections and never
+/// answers would otherwise leave the breaker half-open forever with nobody allowed to
+/// try again — a permanent outage produced by the thing meant to end one.
+const PROBE_DEADLINE: Duration = Duration::from_secs(REQUEST_TIMEOUT.as_secs() * 2);
+
 /// Longest a delivery waits after finding its endpoint at its concurrency cap.
 /// Jittered down from here, so a saturated endpoint's backlog does not return in a
 /// single wave.
@@ -161,6 +169,13 @@ pub struct Sender {
     /// Also shared. A per-clone bulkhead would bound nothing, since the pool makes
     /// one clone per delivery.
     bulkhead: Arc<Bulkhead>,
+    /// Probes issued, and how they went. Shared with every clone.
+    ///
+    /// Worth counting separately from ordinary deliveries: a rising probe count with
+    /// no recoveries is an endpoint that is never coming back, and the two numbers
+    /// together are the only place the breaker's behaviour is visible from outside.
+    probes: Arc<AtomicU64>,
+    probes_recovered: Arc<AtomicU64>,
 }
 
 /// How one delivery attempt behaves.
@@ -234,8 +249,21 @@ impl Sender {
             worker_id: format!("sender-{}", uuid::Uuid::new_v4()),
             limiter: Arc::new(Limiter::new()),
             bulkhead: Arc::new(Bulkhead::new(config.limits)),
+            probes: Arc::new(AtomicU64::new(0)),
+            probes_recovered: Arc::new(AtomicU64::new(0)),
             config,
         }
+    }
+
+    /// Probes issued since start.
+    pub fn probes(&self) -> u64 {
+        self.probes.load(Ordering::Relaxed)
+    }
+
+    /// Probes that closed a breaker. The gap between this and [`Sender::probes`] is
+    /// how much work is being spent on endpoints that are not coming back.
+    pub fn probes_recovered(&self) -> u64 {
+        self.probes_recovered.load(Ordering::Relaxed)
     }
 
     /// The in-flight caps this sender is enforcing.
@@ -408,6 +436,35 @@ impl Sender {
         Ok(Outcome::Deferred { after })
     }
 
+    /// Put a delivery back because another worker is probing this endpoint.
+    ///
+    /// A short wait, and short on purpose: the probe settles the question within one
+    /// request timeout, and whichever way it goes this delivery wants to know. If it
+    /// succeeded the breaker is closed and this can go out; if it failed the breaker
+    /// is open again with a longer cooldown and this will be deferred properly on
+    /// the next look. Jittered so the losers do not all come back together.
+    async fn defer_probe_in_flight(&self, p: PendingDelivery) -> Result<Outcome, SendError> {
+        let after = BUSY_DEFER.mul_f64(rand::random::<f64>().clamp(0.1, 1.0));
+        tracing::debug!(
+            delivery_id = %p.delivery_id,
+            endpoint_id = %p.endpoint_id,
+            ?after,
+            "deferred: another worker is probing this endpoint"
+        );
+
+        self.store
+            .defer_delivery(
+                p.delivery_id,
+                p.attempt,
+                after,
+                "probe in flight",
+                &self.worker_id,
+            )
+            .await?;
+
+        Ok(Outcome::Deferred { after })
+    }
+
     /// Record a delivery that was never sent because its destination was refused.
     async fn refuse(&self, p: PendingDelivery, refused: Refused) -> Result<Outcome, SendError> {
         let error = refused.to_string();
@@ -509,14 +566,42 @@ impl Sender {
         // already failed `threshold` times in a row and every delivery to it is
         // costing a worker a full request timeout to learn what the last thousand
         // established.
+        let mut probing = false;
         if self.config.breaker.is_some() {
             match breaker_gate(&p, Utc::now()) {
                 Gate::Send => {}
                 Gate::Probe => {
-                    // Nothing here picks a winner, so a pool arriving together will
-                    // all probe at once — see `Store::set_breaker_half_open`.
-                    self.store.set_breaker_half_open(p.endpoint_id).await?;
+                    // The cooldown has expired, but that is true for every worker
+                    // holding a delivery to this endpoint. Exactly one may go — a
+                    // server that has just come back after an hour down, met by the
+                    // whole backlog at once, is very likely to fall over again, and
+                    // the breaker would reopen with a longer cooldown. The outage
+                    // would extend itself.
+                    //
+                    // The database picks the winner; the losers wait for the probe's
+                    // deadline like any other blocked delivery.
+                    if self
+                        .store
+                        .claim_probe(p.endpoint_id, PROBE_DEADLINE)
+                        .await?
+                    {
+                        probing = true;
+                        self.probes.fetch_add(1, Ordering::Relaxed);
+                        tracing::info!(endpoint_id = %p.endpoint_id, delivery_id = %p.delivery_id,
+                            "probing a recovering endpoint");
+                    } else {
+                        // Briefly, not until the probe's deadline. The deadline
+                        // governs when a *new* probe may be claimed if this one
+                        // never reports; it is not how long everybody else should
+                        // wait. A probe resolves within one request timeout, and if
+                        // it succeeds the breaker is closed by then — deferring the
+                        // backlog for the full deadline would leave a recovered
+                        // endpoint idle while its deliveries sat waiting on a
+                        // question that had already been answered.
+                        return self.defer_probe_in_flight(p).await;
+                    }
                 }
+                Gate::ProbeInFlight => return self.defer_probe_in_flight(p).await,
                 Gate::Blocked { until } => return self.defer_open_breaker(p, until).await,
             }
         }
@@ -666,10 +751,23 @@ impl Sender {
                 .record_health(p.endpoint_id, health, policy)
                 .await
             {
+                Ok(BreakerState::Open) if probing => tracing::warn!(
+                    endpoint_id = %p.endpoint_id,
+                    "probe failed: breaker reopened with a longer cooldown"
+                ),
                 Ok(BreakerState::Open) => tracing::warn!(
                     endpoint_id = %p.endpoint_id,
                     "breaker opened: deliveries to this endpoint are paused"
                 ),
+                // The gap between probes issued and probes that recovered is how
+                // much work is being spent on endpoints that are not coming back.
+                Ok(BreakerState::Closed) if probing => {
+                    self.probes_recovered.fetch_add(1, Ordering::Relaxed);
+                    tracing::info!(
+                        endpoint_id = %p.endpoint_id,
+                        "probe succeeded: endpoint recovered, deliveries resume"
+                    );
+                }
                 Ok(_) => {}
                 Err(e) => tracing::error!(
                     endpoint_id = %p.endpoint_id, error = %e,
@@ -687,8 +785,10 @@ impl Sender {
 enum Gate {
     /// The breaker is closed, or a probe is already under way.
     Send,
-    /// The cooldown has expired and this delivery is the probe.
+    /// The cooldown has expired and this delivery may try to become the probe.
     Probe,
+    /// Another worker is already probing. Look again shortly.
+    ProbeInFlight,
     /// The endpoint is cut off until `until`.
     Blocked { until: DateTime<Utc> },
 }
@@ -712,10 +812,14 @@ fn breaker_gate(p: &PendingDelivery, now: DateTime<Utc>) -> Gate {
             None => Gate::Send,
         },
         // A probe is in flight. Letting others through would be the rush the
-        // half-open state exists to prevent, so they wait for its deadline.
+        // half-open state exists to prevent — but they should look again soon
+        // rather than wait out the probe's whole deadline, because a probe that
+        // succeeds closes the breaker and they can all go.
         Some(BreakerState::HalfOpen) => match p.breaker_probe_at {
-            Some(at) if at > now => Gate::Blocked { until: at },
-            _ => Gate::Send,
+            Some(at) if at > now => Gate::ProbeInFlight,
+            // The deadline passed with no report. Whoever claimed it is gone, so
+            // this delivery becomes the next probe rather than waiting forever.
+            _ => Gate::Probe,
         },
     }
 }
