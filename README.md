@@ -388,6 +388,41 @@ ever carry. Without that a counter that has never fired is simply absent from th
 scrape, and an empty panel reads exactly like a broken exporter — so the healthiest
 possible state would be indistinguishable from no data at all.
 
+## Asking what happened to an event
+
+```bash
+# One delivery and every attempt made on it
+curl -s localhost:8080/v1/deliveries/$DELIVERY_ID
+
+# An endpoint's history, newest first
+curl -s "localhost:8080/v1/endpoints/$ENDPOINT_ID/deliveries?status=dead&limit=50"
+```
+
+Paged by position, not by `OFFSET`. `OFFSET n` makes the database walk and discard
+`n` rows before returning anything, so page one is instant and page four hundred
+reads forty thousand rows to produce a hundred — on the largest and fastest-growing
+table in the system. It is also wrong under concurrent writes: a delivery created
+between two requests shifts every later row down by one, so the reader sees a row
+twice and never sees another at all.
+
+Each page instead carries its last row's position forward as an opaque `next_cursor`,
+which makes every page an index seek to a known place. Page four hundred costs what
+page one does, and an insert somewhere else in the ordering cannot move it.
+
+The position is `(created_at, id)`, not `created_at` alone. A fan-out writes every
+delivery for one event in a single transaction, so timestamps are routinely tied,
+and paging on a non-unique key skips and repeats rows at every boundary.
+
+An unknown endpoint is a `404` rather than an empty page, and an unrecognised status
+filter is a `400` naming the four that work. Both for the same reason: an empty page
+reads as "this endpoint has had no failures", which is the most reassuring answer
+there is and the wrong one to give somebody who has pasted the wrong id.
+
+Every query is scoped to one endpoint in the store's own `WHERE` clause rather than
+filtered in the handler, so a route added later cannot forget to apply it. The
+endpoint is Relay's ownership boundary today; when tenants exist, the tenant
+predicate joins it there.
+
 ## Reading the logs
 
 Both binaries emit JSON when their stderr is a pipe and human-readable text when it
