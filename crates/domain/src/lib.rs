@@ -9,6 +9,7 @@
 //! different crate.
 
 pub mod backoff;
+pub mod breaker;
 pub mod idempotency;
 pub mod outcome;
 pub mod rate_limit;
