@@ -221,17 +221,29 @@ async fn a_deep_backlog_against_a_dead_endpoint_stops_hammering_it(pool: PgPool)
     // every pass would send every one of them, forever.
     let (endpoint, _) = seed(&store, &receiver, "/always500", 40).await;
 
-    let sender = Pool::with_config(store.clone(), pool_config(), config(Some(policy())));
+    // A cooldown longer than the test, so no probe fires inside it. Without that the
+    // count depends on how many cooldowns elapse while the loop runs, which is a
+    // property of the machine rather than of the breaker.
+    let long_cooldown = breaker::Policy {
+        cooldown: Duration::from_secs(60),
+        max_cooldown: Duration::from_secs(60),
+        ..policy()
+    };
+    let batch = pool_config().batch_size;
+    let sender = Pool::with_config(store.clone(), pool_config(), config(Some(long_cooldown)));
     for _ in 0..15 {
         sender.run_once().await.expect("run");
     }
 
     assert_eq!(state(&store, endpoint).await, "open");
-    // Three to trip it, plus whatever was already in flight in that first batch. The
-    // ceiling is what matters: nowhere near forty, let alone forty per pass.
-    assert!(
-        receiver.hits() <= 12,
-        "the endpoint was hit {} times after tripping at 3",
+    // One batch goes out before any of it has reported, which is what trips the
+    // breaker. Every pass after that sends nothing. The number is exact rather than
+    // a ceiling: `run_once` waits for its batch to drain, so there is no race about
+    // how many were in flight when the breaker opened.
+    assert_eq!(
+        receiver.hits() as usize,
+        batch,
+        "40 deliveries were queued against a dead endpoint and {} were sent",
         receiver.hits()
     );
 }
