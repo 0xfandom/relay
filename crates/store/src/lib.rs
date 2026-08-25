@@ -729,7 +729,7 @@ impl Store {
         endpoint_id: Uuid,
         health: Health,
         policy: &BreakerPolicy,
-    ) -> Result<BreakerState> {
+    ) -> Result<Recorded> {
         let mut tx = self.pool.begin().await?;
 
         let current = sqlx::query_as::<_, BreakerRow>(
@@ -775,7 +775,16 @@ impl Store {
         .await?;
 
         tx.commit().await?;
-        Ok(next.breaker.state)
+        Ok(Recorded {
+            state: next.breaker.state,
+            // A cooldown is set on exactly the transitions that open the breaker, so
+            // this is the one honest answer to "did that attempt trip it". Comparing
+            // the state before and after would not do: an attempt that was already in
+            // flight when the breaker opened leaves it open without tripping
+            // anything, and counting that would inflate the trip rate every time an
+            // outage started.
+            tripped: next.cooldown.is_some(),
+        })
     }
 
     /// Claim the right to probe a recovering endpoint. At most one caller wins.
@@ -959,6 +968,97 @@ impl Store {
                 .await?;
         Ok(n)
     }
+
+    /// A snapshot of the queue, for the metrics endpoint.
+    ///
+    /// One statement rather than four round trips, and — more importantly — one
+    /// snapshot: a scrape reporting eleven pending and nine inflight read a moment
+    /// apart describes a state the system was never actually in.
+    ///
+    /// Written as separate subqueries rather than one pass with `FILTER` on purpose.
+    /// A single pass has to touch every row including the succeeded ones, which are
+    /// the overwhelming majority and never part of the answer. Each subquery here
+    /// carries its own status predicate, which is what lets it land on that status's
+    /// own partial index and count only the rows it is being asked about.
+    pub async fn queue_stats(&self) -> Result<QueueStats> {
+        let row = sqlx::query_as::<_, QueueStats>(
+            "SELECT
+                 (SELECT count(*) FROM deliveries
+                   WHERE status = 'pending')::bigint  AS pending,
+                 (SELECT count(*) FROM deliveries
+                   WHERE status = 'inflight')::bigint AS inflight,
+                 (SELECT count(*) FROM deliveries
+                   WHERE status = 'dead')::bigint     AS dead,
+                 (SELECT count(*) FROM deliveries
+                   WHERE status = 'pending' AND next_attempt_at <= now())::bigint
+                     AS pending_due,
+                 -- Seconds, as a float, so a sub-second queue does not read as zero.
+                 -- NULL when nothing is pending, which is not the same as zero and
+                 -- must not be reported as it: an empty queue has no oldest item.
+                 (SELECT EXTRACT(EPOCH FROM (now() - min(next_attempt_at)))::double precision
+                    FROM deliveries WHERE status = 'pending')
+                     AS oldest_pending_age_secs",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// How many endpoints are in each breaker state.
+    ///
+    /// Read from the endpoints table rather than from the sender's memory, because
+    /// the breaker's state lives in the database precisely so that every replica
+    /// agrees on it. A gauge computed per process would disagree with the thing it
+    /// is reporting on.
+    pub async fn breaker_stats(&self) -> Result<BreakerStats> {
+        let row = sqlx::query_as::<_, BreakerStats>(
+            "SELECT
+                 count(*) FILTER (WHERE breaker_state = 'closed')::bigint    AS closed,
+                 count(*) FILTER (WHERE breaker_state = 'open')::bigint      AS open,
+                 count(*) FILTER (WHERE breaker_state = 'half_open')::bigint AS half_open
+             FROM endpoints",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row)
+    }
+}
+
+/// What one recorded attempt did to an endpoint's breaker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Recorded {
+    /// The breaker's state after the attempt was folded in.
+    pub state: BreakerState,
+    /// Whether *this* attempt is what opened it.
+    pub tripped: bool,
+}
+
+/// The queue as it stood at one instant.
+#[derive(Debug, Clone, Copy, sqlx::FromRow)]
+pub struct QueueStats {
+    pub pending: i64,
+    pub inflight: i64,
+    pub dead: i64,
+    /// Pending *and* due now. The gap between this and `pending` is work that is
+    /// deliberately waiting — a backoff, a deferral — rather than work nobody is
+    /// getting to.
+    pub pending_due: i64,
+    /// How far past its due time the oldest pending delivery is, in seconds.
+    /// Negative while the oldest thing in the queue is not due yet, and `None`
+    /// when the queue is empty.
+    ///
+    /// This is the primary health signal. Depth alone lies in both directions: it
+    /// can be large and healthy while a burst drains, or three rows and
+    /// catastrophic when those three have been stuck for an hour.
+    pub oldest_pending_age_secs: Option<f64>,
+}
+
+/// How many endpoints are cut off, and how many are being tested.
+#[derive(Debug, Clone, Copy, sqlx::FromRow)]
+pub struct BreakerStats {
+    pub closed: i64,
+    pub open: i64,
+    pub half_open: i64,
 }
 
 #[derive(Debug, Serialize)]
