@@ -185,6 +185,56 @@ Buckets live in the dispatcher process, so two dispatcher replicas each keep the
 own and the effective rate doubles. The fix is a shared bucket rather than a
 different algorithm; the arithmetic does not change.
 
+## When Relay stops knocking
+
+Retries and rate limits both assume the endpoint is worth talking to. The circuit
+breaker is the case where it is not: the server has been down for an hour, every
+delivery will time out, and each one costs a worker the full request timeout to learn
+what the last thousand already established.
+
+```
+           5 consecutive failures
+  Closed ─────────────────────────▶ Open
+    ▲                                │
+    │ probe succeeds     cooldown expires
+    │                                ▼
+    └──────────── HalfOpen ◀─────────┘
+                     │
+                     └── probe fails ──▶ Open (longer cooldown)
+```
+
+`HalfOpen` is what earns the design its keep. Without it a breaker that opens never
+closes, because nothing is ever tried again.
+
+**The question is "did the endpoint answer", not "did this succeed."**
+
+| Outcome | Reading |
+| --- | --- |
+| any status the server sent, `404` and `429` included | alive |
+| `5xx` | failing — the server reporting its own fault |
+| timeout, connection refused | failing — nothing answered |
+| unparseable URL, refused address | no evidence either way |
+
+A stream of `404`s is a misconfigured URL and a `429` is a working server asking us
+to slow down. Both servers are up. Tripping on either cuts off a destination that was
+fine while hiding a problem that needs a person.
+
+**State lives on the endpoint row, not in process memory.** This is the difference
+between a breaker that works and one that looks like it does: held in memory it is
+correct with a single worker and silently fails with several, because each sees a
+fraction of the failures, none reaches the threshold, and every worker independently
+concludes the endpoint is merely unlucky. Recording it is a locked read-modify-write,
+so two workers reporting a failure at the same instant count as two.
+
+Like the other deferrals, being held behind an open breaker spends no attempt — and
+this one matters most, because charging attempts for the time an endpoint is cut off
+would empty every pending delivery's retry budget during the outage and they would
+all be dead by the time it came back.
+
+Cooldowns double per consecutive trip and cap at five minutes.
+`RELAY_BREAKER_THRESHOLD`, `RELAY_BREAKER_COOLDOWN_SECS` and
+`RELAY_BREAKER_MAX_COOLDOWN_SECS` configure it; `RELAY_BREAKER=false` disables it.
+
 ## One endpoint cannot take the pool with it
 
 An endpoint that accepts connections and then never replies is the worst kind of
