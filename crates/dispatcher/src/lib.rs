@@ -23,8 +23,10 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use chrono::{DateTime, Utc};
 use relay_domain::{
     backoff::Backoff,
+    breaker::{self, State as BreakerState},
     outcome::{Class, Disposition, Transport, classify_status, classify_transport, disposition},
     rate_limit::{Rate, Take},
     url_guard::{Policy, Refused},
@@ -175,6 +177,12 @@ pub struct SenderConfig {
     pub rate_limit: bool,
     /// How many requests may be in flight, in total and per endpoint.
     pub limits: Limits,
+    /// When to stop delivering to an endpoint entirely, and how long for.
+    ///
+    /// `None` disables the breaker. Off only for tests that are exercising something
+    /// else — an endpoint that fails five times in a row would otherwise trip it and
+    /// change what the test is measuring.
+    pub breaker: Option<breaker::Policy>,
 }
 
 impl Default for SenderConfig {
@@ -184,6 +192,7 @@ impl Default for SenderConfig {
             policy: Policy::default(),
             rate_limit: true,
             limits: Limits::default(),
+            breaker: Some(breaker::Policy::default()),
         }
     }
 }
@@ -359,6 +368,46 @@ impl Sender {
         Ok(Outcome::Deferred { after })
     }
 
+    /// Put a delivery back because its endpoint's breaker is open.
+    ///
+    /// Spends no attempt, like the other two deferrals: nothing was sent. This one
+    /// matters most of the three, because an open breaker means the endpoint is
+    /// *already* failing — charging attempts for the time it is cut off would empty
+    /// every pending delivery's retry budget during the outage, and they would all be
+    /// dead by the time it came back.
+    ///
+    /// The delay runs to the cooldown's expiry plus a jittered margin. Without the
+    /// jitter every delivery blocked during the outage would return in the same
+    /// instant the cooldown ends, which is the flood the breaker exists to prevent,
+    /// merely scheduled.
+    async fn defer_open_breaker(
+        &self,
+        p: PendingDelivery,
+        until: DateTime<Utc>,
+    ) -> Result<Outcome, SendError> {
+        let remaining = (until - Utc::now()).to_std().unwrap_or(Duration::ZERO);
+        let after = remaining + BUSY_DEFER.mul_f64(rand::random::<f64>().clamp(0.1, 1.0));
+
+        tracing::debug!(
+            delivery_id = %p.delivery_id,
+            endpoint_id = %p.endpoint_id,
+            ?after,
+            "deferred: endpoint breaker is open"
+        );
+
+        self.store
+            .defer_delivery(
+                p.delivery_id,
+                p.attempt,
+                after,
+                "endpoint breaker open",
+                &self.worker_id,
+            )
+            .await?;
+
+        Ok(Outcome::Deferred { after })
+    }
+
     /// Record a delivery that was never sent because its destination was refused.
     async fn refuse(&self, p: PendingDelivery, refused: Refused) -> Result<Outcome, SendError> {
         let error = refused.to_string();
@@ -456,6 +505,22 @@ impl Sender {
             }
         }
 
+        // Last gate before the request. An open breaker means the endpoint has
+        // already failed `threshold` times in a row and every delivery to it is
+        // costing a worker a full request timeout to learn what the last thousand
+        // established.
+        if self.config.breaker.is_some() {
+            match breaker_gate(&p, Utc::now()) {
+                Gate::Send => {}
+                Gate::Probe => {
+                    // Nothing here picks a winner, so a pool arriving together will
+                    // all probe at once — see `Store::set_breaker_half_open`.
+                    self.store.set_breaker_half_open(p.endpoint_id).await?;
+                }
+                Gate::Blocked { until } => return self.defer_open_breaker(p, until).await,
+            }
+        }
+
         // A refused destination is permanent — no amount of retrying makes an
         // internal address public — and nothing about the refusal is written back to
         // the caller's response snippet, because the party who chose the URL must not
@@ -496,7 +561,7 @@ impl Sender {
 
         let latency_ms = started.elapsed().as_millis() as i32;
 
-        let (outcome, http_status, error, snippet, retry_after) = match result {
+        let (outcome, http_status, error, snippet, retry_after, transport) = match result {
             Ok(resp) => {
                 let status = resp.status().as_u16();
                 let class = classify_status(status);
@@ -516,6 +581,7 @@ impl Sender {
                         None,
                         Some(snippet),
                         retry_after,
+                        None,
                     )
                 } else {
                     (
@@ -528,20 +594,30 @@ impl Sender {
                         Some(format!("HTTP {status}")),
                         Some(snippet),
                         retry_after,
+                        None,
                     )
                 }
             }
-            Err(e) => (
-                Outcome::Failed {
-                    class: classify_transport(transport_of(&e)),
-                    status: None,
-                    error: e.to_string(),
-                },
-                None,
-                Some(e.to_string()),
-                None,
-                None,
-            ),
+            Err(e) => {
+                // Kept as well as classified. The retry policy only needs to know
+                // whether another try could work; the breaker needs to know whether
+                // anything answered, and those are different questions — an
+                // unparseable URL is permanent for one and no evidence at all for
+                // the other.
+                let transport = transport_of(&e);
+                (
+                    Outcome::Failed {
+                        class: classify_transport(transport),
+                        status: None,
+                        error: e.to_string(),
+                    },
+                    None,
+                    Some(e.to_string()),
+                    None,
+                    None,
+                    Some(transport),
+                )
+            }
         };
 
         let (class, result) = match &outcome {
@@ -575,7 +651,72 @@ impl Sender {
             )
             .await?;
 
+        // Fold this attempt into the endpoint's breaker. A separate write rather
+        // than part of the transaction above: the delivery's own record is what must
+        // never be lost, and coupling the breaker to it would mean a contended
+        // endpoint row could fail an attempt that had already been made.
+        //
+        // The question asked is "did the endpoint answer", not "did this succeed" —
+        // a 404 is a wrong path on a working server, and tripping on it would cut
+        // off a healthy destination while hiding a problem that needs a person.
+        if let Some(policy) = &self.config.breaker {
+            let health = breaker::health(http_status.map(|s| s as u16), transport);
+            match self
+                .store
+                .record_health(p.endpoint_id, health, policy)
+                .await
+            {
+                Ok(BreakerState::Open) => tracing::warn!(
+                    endpoint_id = %p.endpoint_id,
+                    "breaker opened: deliveries to this endpoint are paused"
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::error!(
+                    endpoint_id = %p.endpoint_id, error = %e,
+                    "could not record endpoint health"
+                ),
+            }
+        }
+
         Ok(outcome)
+    }
+}
+
+/// What the breaker says about one delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    /// The breaker is closed, or a probe is already under way.
+    Send,
+    /// The cooldown has expired and this delivery is the probe.
+    Probe,
+    /// The endpoint is cut off until `until`.
+    Blocked { until: DateTime<Utc> },
+}
+
+/// Read the breaker state carried on the claim.
+///
+/// A pure function of the row, so it costs no query. The state can be a few
+/// milliseconds stale — another worker may have tripped the breaker in between — and
+/// that is the deliberate trade: a handful of extra requests to an endpoint that is
+/// already failing, against one extra query per delivery forever.
+fn breaker_gate(p: &PendingDelivery, now: DateTime<Utc>) -> Gate {
+    match BreakerState::parse(&p.breaker_state) {
+        // The overwhelming majority of deliveries take this branch.
+        Some(BreakerState::Closed) | None => Gate::Send,
+        Some(BreakerState::Open) => match p.breaker_probe_at {
+            Some(at) if at <= now => Gate::Probe,
+            Some(at) => Gate::Blocked { until: at },
+            // An open breaker with no probe time would be cut off forever. The
+            // schema forbids it; if it happens anyway, deliver rather than
+            // blackhole the endpoint.
+            None => Gate::Send,
+        },
+        // A probe is in flight. Letting others through would be the rush the
+        // half-open state exists to prevent, so they wait for its deadline.
+        Some(BreakerState::HalfOpen) => match p.breaker_probe_at {
+            Some(at) if at > now => Gate::Blocked { until: at },
+            _ => Gate::Send,
+        },
     }
 }
 

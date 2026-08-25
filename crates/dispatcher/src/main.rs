@@ -67,11 +67,30 @@ async fn main() -> anyhow::Result<()> {
         per_endpoint: env_usize("RELAY_MAX_PER_ENDPOINT", 8)?,
     };
 
+    // When to stop delivering to an endpoint entirely. Off only for a deliberate
+    // load test — an endpoint that has failed five times in a row is costing a
+    // worker a full request timeout per delivery to learn nothing new.
+    let breaker = if std::env::var("RELAY_BREAKER")
+        .map(|v| v == "false" || v == "0")
+        .unwrap_or(false)
+    {
+        None
+    } else {
+        Some(relay_domain::breaker::Policy {
+            threshold: env_usize("RELAY_BREAKER_THRESHOLD", 5)? as u32,
+            cooldown: Duration::from_secs(env_usize("RELAY_BREAKER_COOLDOWN_SECS", 30)? as u64),
+            max_cooldown: Duration::from_secs(
+                env_usize("RELAY_BREAKER_MAX_COOLDOWN_SECS", 300)? as u64
+            ),
+        })
+    };
+
     let sender_config = SenderConfig {
         backoff: Default::default(),
         policy: Policy { allow_private },
         rate_limit,
         limits,
+        breaker,
     };
 
     let store = Store::connect(&database_url, db_connections as u32).await?;
@@ -94,6 +113,7 @@ async fn main() -> anyhow::Result<()> {
         rate_limit,
         max_in_flight = limits.max_in_flight,
         max_per_endpoint = limits.per_endpoint,
+        breaker = ?breaker,
         "relay-dispatcher started"
     );
 
