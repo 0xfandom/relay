@@ -492,7 +492,12 @@ async fn a_probe_that_never_reports_does_not_block_the_next_one(pool: PgPool) {
     // The deadline passes. Note it takes an `open` breaker to reclaim, which is what
     // the recovery path below produces; here the deadline alone must at least not
     // leave the endpoint permanently unreachable, so a delivery is admitted again.
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    //
+    // Polled rather than slept through. A fixed sleep just longer than the deadline
+    // reads as safe and is not: the deadline is stamped by Postgres and read against
+    // this process's clock, and the two are in different containers. Fifty
+    // milliseconds of margin is well inside the drift between them.
+    wait_for_probe_time(&store, endpoint).await;
     let claimed = store.pending_delivery_by_id(ids[3]).await.unwrap().unwrap();
     assert_eq!(claimed.breaker_state, "half_open");
     assert!(
