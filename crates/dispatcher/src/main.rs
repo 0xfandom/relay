@@ -96,6 +96,24 @@ async fn main() -> anyhow::Result<()> {
     let store = Store::connect(&database_url, db_connections as u32).await?;
     store.migrate().await?;
 
+    // Installed before anything can record, and only ever once per process: the
+    // recorder is global, and every `relay_metrics` call made before this point is
+    // silently dropped. Failing to install is logged rather than fatal — a
+    // dispatcher that will not deliver webhooks because it could not set up a
+    // counter is a worse outage than the one it was meant to help diagnose.
+    let metrics_bind =
+        std::env::var("RELAY_METRICS_BIND").unwrap_or_else(|_| "0.0.0.0:9091".into());
+    let exporter = match relay_metrics::Exporter::install() {
+        // The dispatcher owns the queue, so it is the one process that exports the
+        // queue gauges. See the note in `relay-metrics`: two reporters of the same
+        // database rows would double every panel that sums across instances.
+        Ok(e) => Some(e.with_queue_gauges(store.clone())),
+        Err(e) => {
+            tracing::error!(error = %e, "metrics recorder could not be installed");
+            None
+        }
+    };
+
     // Rejected at startup rather than tolerated, because a lease shorter than the
     // request timeout produces duplicate deliveries and nothing else would report it.
     let reaper = Arc::new(Reaper::new(store.clone(), reaper_config.clone())?);
@@ -114,6 +132,7 @@ async fn main() -> anyhow::Result<()> {
         max_in_flight = limits.max_in_flight,
         max_per_endpoint = limits.per_endpoint,
         breaker = ?breaker,
+        %metrics_bind,
         "relay-dispatcher started"
     );
 
@@ -135,6 +154,12 @@ async fn main() -> anyhow::Result<()> {
         signalled.cancel();
     });
 
+    let metrics_loop = exporter.map(|exporter| {
+        let cancel = cancel.clone();
+        let bind = metrics_bind.clone();
+        tokio::spawn(async move { exporter.serve(&bind, cancel).await })
+    });
+
     let reaper_loop = {
         let cancel = cancel.clone();
         tokio::spawn(async move { reaper.run(cancel).await })
@@ -152,6 +177,9 @@ async fn main() -> anyhow::Result<()> {
         .await;
     let _ = reaper_loop.await;
     let _ = pruner_loop.await;
+    if let Some(metrics_loop) = metrics_loop {
+        let _ = metrics_loop.await;
+    }
 
     tracing::info!("relay-dispatcher stopped");
     Ok(())
