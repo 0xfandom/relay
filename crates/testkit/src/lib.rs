@@ -31,6 +31,8 @@ use axum::{
 };
 use serde::Deserialize;
 
+pub mod metrics;
+
 /// How far out of date a timestamp may be before the request is treated as a
 /// replay. Five minutes is the conventional window.
 const TOLERANCE_SECS: i64 = 300;
