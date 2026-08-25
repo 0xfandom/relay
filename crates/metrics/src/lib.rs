@@ -1,4 +1,4 @@
-//! What Relay reports about itself.
+//! What Relay reports about itself: its metrics, and the shape of its logs.
 //!
 //! Every metric name and label used anywhere in Relay is defined in this file, and
 //! nothing else calls the `metrics` macros directly. That is the whole reason the
@@ -18,6 +18,8 @@
 //! that summed across instances would multiply the queue by the replica count.
 
 use std::time::Duration;
+
+pub mod logging;
 
 use axum::{Router, extract::State, response::IntoResponse, routing::get};
 use metrics_exporter_prometheus::{BuildError, Matcher, PrometheusBuilder, PrometheusHandle};
