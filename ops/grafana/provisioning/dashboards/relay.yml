@@ -1,0 +1,14 @@
+# Loads every dashboard in the mounted directory on startup.
+
+apiVersion: 1
+
+providers:
+  - name: relay
+    type: file
+    # Read-only in the UI. A dashboard edited in Grafana and not written back to the
+    # repository is a dashboard that disappears the next time the container is
+    # recreated, which is a worse outcome than not being able to edit it.
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

@@ -1,0 +1,17 @@
+# Provisioned so that `docker compose up` is the whole setup.
+#
+# The uid is fixed and referenced by the dashboard. Letting Grafana generate one
+# would mean the checked-in dashboard pointed at a datasource that does not exist
+# until somebody clicks through the UI — which is exactly the manual configuration
+# this file removes.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: relay-prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
