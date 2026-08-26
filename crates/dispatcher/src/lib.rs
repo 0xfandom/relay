@@ -818,8 +818,12 @@ impl Sender {
         // Sign the stored bytes, and send those same bytes. Nothing in between may
         // parse and re-encode the payload: JSON key order is not defined, and the
         // signature covers bytes rather than meaning.
-        let signature =
-            relay_domain::signature::sign(p.secret.as_bytes(), timestamp, &p.raw_payload);
+        //
+        // During a rotation's overlap window both secrets sign, and both signatures
+        // go out together. There is no ordering of "we switch" and "they switch"
+        // that avoids failed deliveries otherwise: whichever side moves first is
+        // wrong until the other catches up.
+        let signatures = sign_all(&p, timestamp);
 
         let started = Instant::now();
         // The one span that covers time spent on somebody else's server. Everything
@@ -831,9 +835,10 @@ impl Sender {
             .post(&p.url)
             .header("content-type", "application/json")
             .header("relay-timestamp", timestamp.to_string())
-            // A list, not a single value, so a secret can be rotated with an overlap
-            // window instead of a cutover. M8 fills in the second entry.
-            .header("relay-signature", format!("v1={signature}"))
+            // A list, not a single value. The receiver matches on any entry, so it
+            // can move to the new secret at any point inside the window and nothing
+            // fails on either side of the switch.
+            .header("relay-signature", &signatures)
             // Stable across every attempt of this delivery. If this changed per
             // attempt, receivers could not deduplicate retries.
             .header("relay-delivery-id", p.delivery_id.to_string())
@@ -1704,6 +1709,27 @@ impl Pruner {
             }
         }
     }
+}
+
+/// The `Relay-Signature` header value: every secret currently valid for this
+/// endpoint, newest first.
+///
+/// Newest first because a receiver that only checks the first entry — which the
+/// format permits but the docs discourage — should be checking the one it will end
+/// up on, not the one it is leaving.
+fn sign_all(p: &PendingDelivery, timestamp: i64) -> String {
+    let mut out = format!(
+        "v1={}",
+        relay_domain::signature::sign(p.secret.expose(), timestamp, &p.raw_payload)
+    );
+    if let Some(previous) = &p.previous_secret {
+        out.push(',');
+        out.push_str(&format!(
+            "v1={}",
+            relay_domain::signature::sign(previous.expose(), timestamp, &p.raw_payload)
+        ));
+    }
+    out
 }
 
 fn unix_now() -> i64 {
