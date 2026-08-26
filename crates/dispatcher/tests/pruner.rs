@@ -57,17 +57,18 @@ async fn only_keys_past_the_window_are_deleted(pool: PgPool) {
     let pruner = Pruner::new(
         store.clone(),
         PrunerConfig {
-            retention: DAY,
+            idempotency: DAY,
             interval: Duration::from_secs(3600),
+            ..PrunerConfig::default()
         },
     );
 
-    assert_eq!(pruner.prune_once().await.expect("prune"), 1);
+    assert_eq!(pruner.prune_once().await.expect("prune").keys_pruned, 1);
     assert_eq!(pruner.pruned(), 1);
     assert_eq!(key_count(&store).await, 2);
 
     // A second sweep with nothing to do is not an error and does not double-count.
-    assert_eq!(pruner.prune_once().await.expect("prune"), 0);
+    assert_eq!(pruner.prune_once().await.expect("prune").keys_pruned, 0);
     assert_eq!(pruner.pruned(), 1);
 }
 
@@ -82,7 +83,7 @@ async fn pruning_a_key_leaves_its_event_and_deliveries(pool: PgPool) {
     backdate(&store, "expired", 25).await;
 
     let pruner = Pruner::new(store.clone(), PrunerConfig::default());
-    assert_eq!(pruner.prune_once().await.expect("prune"), 1);
+    assert_eq!(pruner.prune_once().await.expect("prune").keys_pruned, 1);
 
     // Forgetting that a request was made is not the same as undoing it. The
     // deliveries it created are still owed to the endpoint.
@@ -109,8 +110,9 @@ async fn the_loop_stops_when_cancelled(pool: PgPool) {
     let pruner = Pruner::new(
         store.clone(),
         PrunerConfig {
-            retention: DAY,
+            idempotency: DAY,
             interval: Duration::from_secs(3600),
+            ..PrunerConfig::default()
         },
     );
 
@@ -141,5 +143,5 @@ async fn the_default_window_is_a_day(pool: PgPool) {
     // Asserted rather than assumed, because it is a documented part of the contract:
     // a duplicate arriving after this window creates a second event.
     let _ = Store::from_pool(pool);
-    assert_eq!(PrunerConfig::default().retention, DAY);
+    assert_eq!(PrunerConfig::default().idempotency, DAY);
 }
