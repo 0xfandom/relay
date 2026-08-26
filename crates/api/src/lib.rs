@@ -27,6 +27,32 @@ use extract::RawBody;
 #[derive(Clone)]
 pub struct AppState {
     pub store: Store,
+    /// What registration will accept.
+    ///
+    /// Read from the same place the dispatcher reads it, because the two disagreeing
+    /// is the failure this guards against: a URL accepted here and refused at send
+    /// time is a delivery that dies in the dead letter queue for a reason the caller
+    /// was never told at the point they could have fixed it.
+    pub policy: Policy,
+}
+
+impl AppState {
+    /// The strict policy. Tests that are not about the guard use this; the binary
+    /// reads the environment.
+    pub fn new(store: Store) -> Self {
+        Self {
+            store,
+            policy: Policy::default(),
+        }
+    }
+
+    /// For local development and tests with receivers on loopback.
+    pub fn permissive(store: Store) -> Self {
+        Self {
+            store,
+            policy: Policy::permissive(),
+        }
+    }
 }
 
 pub fn router(state: AppState) -> Router {
@@ -137,12 +163,21 @@ async fn create_endpoint(
     // trusting. Rejecting an obviously bad URL here saves the caller a round trip
     // and a delivery that was always going to be refused.
     let parsed = reqwest_url(&req.url)?;
-    Policy::default()
-        .check_scheme(parsed.scheme())
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    if parsed.host_str().is_none() {
+    let bad = |e: relay_domain::url_guard::Refused| ApiError::BadRequest(e.to_string());
+    state.policy.check_scheme(parsed.scheme()).map_err(bad)?;
+    // An empty host as well as a missing one. Nothing that can be connected to, and
+    // cheaper to refuse by name than to let it fail as "resolved to nothing" in a
+    // different process an hour later.
+    if parsed.host_str().is_none_or(str::is_empty) {
         return Err(ApiError::BadRequest("url has no host".into()));
     }
+    // The port is a property of the URL, so it can be settled now. The *address* is
+    // not — that is a DNS answer, and the only one worth trusting is the one
+    // resolved at the moment of connecting.
+    state
+        .policy
+        .check_port(parsed.port_or_known_default().unwrap_or(80))
+        .map_err(bad)?;
 
     let rate = requested_rate(&req)?;
 

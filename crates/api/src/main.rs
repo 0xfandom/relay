@@ -12,6 +12,14 @@ async fn main() -> anyhow::Result<()> {
     let store = Store::connect(&database_url, 5).await?;
     store.migrate().await?;
 
+    // The same policy the dispatcher builds, from the same variables. Registration
+    // is a courtesy check — the authority is the send path, which resolves the
+    // address at the moment it connects — but a courtesy check that disagrees with
+    // the authority is worse than none: it accepts URLs that will never deliver.
+    let policy = relay_domain::url_guard::Policy::from_env();
+    tracing::info!(?policy, "endpoint policy");
+    let state = AppState { store, policy };
+
     // Logged and carried on rather than fatal. An API that refuses to accept events
     // because it could not install a counter has turned a missing dashboard into a
     // lost webhook.
@@ -20,10 +28,10 @@ async fn main() -> anyhow::Result<()> {
         // process shares with the dispatcher, and the dispatcher is the one that
         // reports them — two reporters would double every panel that sums across
         // instances.
-        Ok(exporter) => router_with_metrics(AppState { store }, exporter),
+        Ok(exporter) => router_with_metrics(state, exporter),
         Err(e) => {
             tracing::error!(error = %e, "metrics recorder could not be installed");
-            router(AppState { store })
+            router(state)
         }
     };
 
