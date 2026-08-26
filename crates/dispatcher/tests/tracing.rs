@@ -299,6 +299,42 @@ async fn the_signing_secret_never_reaches_the_log(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../store/migrations")]
+async fn a_rotation_does_not_put_either_secret_in_the_log(pool: PgPool) {
+    let _guard = ONE_AT_A_TIME.lock().await;
+    let captured = capture();
+    let mark = captured.mark();
+    let store = Store::from_pool(pool);
+    let receiver = Receiver::new(SECRET);
+    seed(&store, &receiver, "/verify", 1).await;
+
+    // Mid-rotation, so two secrets are live and both are signing. The header that
+    // goes out carries two signatures — hashes, not keys — and neither key may
+    // appear anywhere in the output.
+    let endpoint: uuid::Uuid = sqlx::query_scalar("SELECT id FROM endpoints LIMIT 1")
+        .fetch_one(store.pool())
+        .await
+        .expect("endpoint");
+    let rotated = "whsec_the_new_one_must_not_be_logged_either";
+    store
+        .rotate_secret(endpoint, rotated, Duration::from_secs(3600))
+        .await
+        .expect("rotate");
+
+    Pool::with_config(store, pool_config(), config())
+        .run_once()
+        .await
+        .expect("run");
+
+    let text = captured.text_since(mark);
+    assert!(!text.contains(SECRET), "the old secret was logged");
+    assert!(!text.contains(rotated), "the new secret was logged");
+    assert!(
+        !text.contains("whsec_"),
+        "something secret-shaped was logged"
+    );
+}
+
+#[sqlx::test(migrations = "../store/migrations")]
 async fn a_claimed_row_cannot_print_its_own_secret(pool: PgPool) {
     let store = Store::from_pool(pool);
     let receiver = Receiver::new(SECRET);
