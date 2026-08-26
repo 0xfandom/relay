@@ -21,7 +21,7 @@ use uuid::Uuid;
 pub mod models;
 
 pub use models::{
-    Attempt, BreakerRow, DeadLetter, Delivery, DeliverySummary, Endpoint, PendingDelivery,
+    Attempt, BreakerRow, DeadLetter, Delivery, DeliverySummary, Endpoint, PendingDelivery, Secret,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -123,6 +123,11 @@ const CLAIM_BATCH_SQL: &str = concat!(
             ep.id         AS endpoint_id,
             ep.url        AS url,
             ep.secret     AS secret,
+            -- NULL once the window has closed, decided here rather than by a
+            -- sweeper: an old secret that keeps being sent because a cleanup job
+            -- died is a rotation that never finished.
+            CASE WHEN ep.previous_secret_expires_at > now()
+                 THEN ep.previous_secret END AS previous_secret,
             ep.rate_per_second AS rate_per_second,
             ep.burst      AS burst,
             ep.breaker_state AS breaker_state,
@@ -316,6 +321,51 @@ impl Store {
         .fetch_one(&self.pool)
         .await?;
         Ok(ep)
+    }
+
+    /// Promote a new signing secret and demote the current one.
+    ///
+    /// One statement, so there is no instant at which the row holds a new secret and
+    /// no previous one — which is the state that would drop every in-flight delivery
+    /// signed with the old key.
+    ///
+    /// Rotating twice inside one window deliberately discards the secret from the
+    /// first rotation. Keeping a chain would mean an endpoint could accumulate any
+    /// number of live secrets, and "how many keys can sign as you" is exactly the
+    /// number a rotation exists to keep at one.
+    pub async fn rotate_secret(&self, id: Uuid, new_secret: &str, overlap: Duration) -> Result<()> {
+        let n = sqlx::query(
+            "UPDATE endpoints
+             SET previous_secret = secret,
+                 previous_secret_expires_at = now() + make_interval(secs => $3),
+                 secret = $2
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind(new_secret)
+        .bind(overlap.as_secs_f64())
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+
+        if n == 0 {
+            return Err(StoreError::EndpointNotFound);
+        }
+        Ok(())
+    }
+
+    /// The rotation state of an endpoint, for the API's response and for tests.
+    pub async fn secret_rotation(&self, id: Uuid) -> Result<Rotation> {
+        sqlx::query_as::<_, Rotation>(
+            "SELECT previous_secret IS NOT NULL AND previous_secret_expires_at > now()
+                        AS overlapping,
+                    previous_secret_expires_at AS expires_at
+             FROM endpoints WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StoreError::EndpointNotFound)
     }
 
     pub async fn get_endpoint(&self, id: Uuid) -> Result<Endpoint> {
@@ -534,6 +584,8 @@ impl Store {
                     ep.id           AS endpoint_id,
                     ep.url          AS url,
                     ep.secret       AS secret,
+                    CASE WHEN ep.previous_secret_expires_at > now()
+                         THEN ep.previous_secret END AS previous_secret,
                     ep.rate_per_second AS rate_per_second,
                     ep.burst        AS burst,
                     ep.breaker_state AS breaker_state,
@@ -563,6 +615,8 @@ impl Store {
                     ep.id           AS endpoint_id,
                     ep.url          AS url,
                     ep.secret       AS secret,
+                    CASE WHEN ep.previous_secret_expires_at > now()
+                         THEN ep.previous_secret END AS previous_secret,
                     ep.rate_per_second AS rate_per_second,
                     ep.burst        AS burst,
                     ep.breaker_state AS breaker_state,
@@ -1120,6 +1174,14 @@ impl Store {
         .await?;
         Ok(row)
     }
+}
+
+/// Whether an endpoint is mid-rotation, and until when.
+#[derive(Debug, Clone, Copy, sqlx::FromRow, Serialize)]
+pub struct Rotation {
+    /// True while both signatures are being sent.
+    pub overlapping: Option<bool>,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Where the previous page stopped.
