@@ -449,6 +449,46 @@ The dashboard is read-only in the UI. One edited in Grafana and not written back
 the repository disappears the next time the container is recreated, which is worse
 than not being able to edit it.
 
+## Rotating a signing secret
+
+```bash
+curl -sX POST localhost:8080/v1/endpoints/$ENDPOINT_ID/rotate-secret
+# {"id":"...","secret":"whsec_...","previous_secret_expires_at":"2026-08-27T09:00:00Z"}
+```
+
+A single-secret rotation is a cutover, and there is no ordering of the two changes
+that avoids failed deliveries. If Relay switches first, every receiver still
+checking the old secret rejects us. If the receiver switches first, they reject us
+until we catch up. The customer cannot fix that by deploying faster.
+
+So both secrets sign during an overlap window and the `Relay-Signature` header
+carries both, comma-separated:
+
+```
+Relay-Signature: v1=<new>,v1=<old>
+```
+
+A receiver that matches on *any* entry — which is what the format has always asked
+for — can switch at any moment inside the window with nothing failing on either
+side. `RELAY_SECRET_OVERLAP_SECS` sets the window, 24 hours by default: it has to
+be long enough for the customer to notice, change a value and roll a fleet, or it
+expires mid-migration and causes the outage it exists to prevent.
+
+Rotating twice inside one window discards the secret from the first rotation. That
+is deliberate — "how many keys can sign as you" is exactly the number a rotation
+exists to keep at one, and a chain of previous secrets would let it grow without
+limit. The header therefore never carries more than two.
+
+The old secret stops being sent because the query stops selecting it, not because
+anything sweeps it. A cleanup job that quietly died must not be able to keep a
+retired secret alive.
+
+Secrets are a `Secret` type with no `Display` at all — `{secret}` does not compile —
+and a `Debug` that prints `<redacted>`. Reading the bytes takes `expose()`, which is
+awkward to type and trivial to grep for at review. The failure mode of the
+alternative is one log line written during an incident, after which every customer
+has to be told to change their verification key.
+
 ## Asking what happened to an event
 
 ```bash
