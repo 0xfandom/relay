@@ -1267,6 +1267,12 @@ pub enum DeadReason {
     PermanentFailure,
     /// It might have worked, and we ran out of tries.
     AttemptsExhausted,
+    /// Nothing was sent at all: the destination is not somewhere Relay will connect
+    /// to. Kept apart from a permanent failure because it is a security signal
+    /// rather than a delivery problem — a customer pointing an endpoint at an
+    /// internal address is either confused or probing, and folded in with ordinary
+    /// `404`s a spike in it looks like somebody deploying a broken URL.
+    Refused,
 }
 
 impl DeadReason {
@@ -1274,6 +1280,7 @@ impl DeadReason {
         match self {
             Self::PermanentFailure => "permanent_failure",
             Self::AttemptsExhausted => "attempts_exhausted",
+            Self::Refused => "refused",
         }
     }
 
@@ -1281,6 +1288,7 @@ impl DeadReason {
         match s {
             "permanent_failure" => Some(Self::PermanentFailure),
             "attempts_exhausted" => Some(Self::AttemptsExhausted),
+            "refused" => Some(Self::Refused),
             _ => None,
         }
     }

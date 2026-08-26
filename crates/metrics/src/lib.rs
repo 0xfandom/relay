@@ -312,8 +312,8 @@ fn initialise() {
     ] {
         metrics::counter!(DEFERRALS, "reason" => reason.as_str()).increment(0);
     }
-    // The two values `deliveries.dead_reason` is constrained to.
-    for reason in ["permanent_failure", "attempts_exhausted"] {
+    // The values `deliveries.dead_reason` is constrained to.
+    for reason in ["permanent_failure", "attempts_exhausted", "refused"] {
         metrics::counter!(DEAD, "reason" => reason).increment(0);
     }
     for outcome in [
