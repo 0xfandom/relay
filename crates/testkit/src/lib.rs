@@ -49,6 +49,12 @@ struct Inner {
     received: Mutex<Vec<String>>,
     /// Bodies seen, for assertions about byte fidelity.
     bodies: Mutex<Vec<Vec<u8>>>,
+    /// The `Relay-Signature` header of each request, in order.
+    ///
+    /// Kept because during a secret rotation the *shape* of this header is the
+    /// contract: two entries while both secrets are live, one after. A receiver that
+    /// only checked whether verification passed could not tell those apart.
+    signatures: Mutex<Vec<String>>,
     hits: AtomicU64,
     /// Requests being served right now, and the high-water mark.
     ///
@@ -94,6 +100,7 @@ impl Receiver {
                 secret: secret.into(),
                 received: Mutex::new(Vec::new()),
                 bodies: Mutex::new(Vec::new()),
+                signatures: Mutex::new(Vec::new()),
                 hits: AtomicU64::new(0),
                 in_flight: AtomicU64::new(0),
                 max_in_flight: AtomicU64::new(0),
@@ -113,6 +120,16 @@ impl Receiver {
 
     pub fn bodies(&self) -> Vec<Vec<u8>> {
         self.inner.bodies.lock().unwrap().clone()
+    }
+
+    /// Every `Relay-Signature` header seen, in order.
+    pub fn signature_headers(&self) -> Vec<String> {
+        self.inner.signatures.lock().unwrap().clone()
+    }
+
+    /// The most recent `Relay-Signature` header.
+    pub fn last_signature_header(&self) -> Option<String> {
+        self.inner.signatures.lock().unwrap().last().cloned()
     }
 
     pub fn hits(&self) -> u64 {
@@ -163,6 +180,9 @@ fn record(state: &Receiver, headers: &HeaderMap, body: &Bytes) -> InFlight {
         state.inner.received.lock().unwrap().push(id.to_string());
     }
     state.inner.bodies.lock().unwrap().push(body.to_vec());
+    if let Some(sig) = headers.get("relay-signature").and_then(|v| v.to_str().ok()) {
+        state.inner.signatures.lock().unwrap().push(sig.to_string());
+    }
     InFlight::enter(state.inner.clone())
 }
 
