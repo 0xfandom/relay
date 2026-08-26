@@ -20,7 +20,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use relay_dispatcher::{Bulkhead, Limits, Pool, PoolConfig, SenderConfig};
+use relay_dispatcher::{Bulkhead, Limits, Pool, PoolConfig, RequestLimits, SenderConfig};
 use relay_domain::{backoff::Backoff, rate_limit::Rate, url_guard::Policy};
 use relay_store::Store;
 use relay_testkit::Receiver;
@@ -38,6 +38,7 @@ fn config(limits: Limits) -> SenderConfig {
         policy: Policy::permissive(),
         // Off: this file is about concurrency, and a token shortage would look
         // exactly like a bulkhead deferral in the results.
+        request: RequestLimits::default(),
         rate_limit: false,
         // Breaker off: several of these tests fail one endpoint repeatedly on
         // purpose, and tripping it would replace the behaviour under test with a
@@ -294,6 +295,7 @@ async fn a_delivery_stopped_by_the_bulkhead_does_not_spend_a_token(pool: PgPool)
         pool_config(),
         SenderConfig {
             // On, deliberately: the point is what happens when both gates are live.
+            request: RequestLimits::default(),
             rate_limit: true,
             // Breaker off: several of these tests fail one endpoint repeatedly on
             // purpose, and tripping it would replace the behaviour under test with a

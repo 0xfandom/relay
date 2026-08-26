@@ -14,7 +14,7 @@ use std::{
     time::Duration,
 };
 
-use relay_dispatcher::{Limits, Pool, PoolConfig, SenderConfig};
+use relay_dispatcher::{Limits, Pool, PoolConfig, RequestLimits, SenderConfig};
 use relay_domain::{backoff::Backoff, url_guard::Policy};
 use relay_store::Store;
 use relay_testkit::Receiver;
@@ -115,6 +115,7 @@ fn config() -> SenderConfig {
             retry_after_cap: Duration::from_secs(300),
         },
         policy: Policy::permissive(),
+        request: RequestLimits::default(),
         rate_limit: false,
         limits: Limits {
             max_in_flight: 1024,

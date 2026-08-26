@@ -14,7 +14,9 @@
 
 use std::time::Duration;
 
-use relay_dispatcher::{Pool, PoolConfig, REQUEST_TIMEOUT, Reaper, ReaperConfig, SenderConfig};
+use relay_dispatcher::{
+    Pool, PoolConfig, REQUEST_TIMEOUT, Reaper, ReaperConfig, RequestLimits, SenderConfig,
+};
 use relay_domain::url_guard::Policy;
 use relay_store::Store;
 use relay_testkit::Receiver;
@@ -268,6 +270,7 @@ fn local() -> SenderConfig {
         policy: Policy::permissive(),
         // Rate limiting off: these tests are about something else, and a deferral
         // would add attempt rows for requests that were never made.
+        request: RequestLimits::default(),
         rate_limit: false,
         // Breaker off: several of these tests fail one endpoint repeatedly on
         // purpose, and tripping it would replace the behaviour under test with a
@@ -275,4 +278,31 @@ fn local() -> SenderConfig {
         breaker: None,
         ..Default::default()
     }
+}
+
+#[tokio::test]
+async fn a_lease_shorter_than_a_raised_request_timeout_is_rejected() {
+    // The two are configured independently, and raising one without the other is a
+    // silent source of duplicate deliveries: the lease expires while a request is
+    // still in flight, the reaper hands the row to a second worker, and the endpoint
+    // receives the same webhook twice with nothing anywhere reporting why.
+    //
+    // A 30-second lease is perfectly safe against the default 10-second timeout and
+    // unsafe against a 60-second one, so checking against a constant would have
+    // approved this.
+    let store = Store::from_pool(sqlx::PgPool::connect_lazy("postgres://unused").unwrap());
+    let config = ReaperConfig {
+        lease_ttl: Duration::from_secs(30),
+        interval: Duration::from_secs(10),
+    };
+
+    assert!(
+        Reaper::with_request_timeout(store.clone(), config.clone(), Duration::from_secs(10))
+            .is_ok()
+    );
+    let Err(err) = Reaper::with_request_timeout(store, config, Duration::from_secs(60)) else {
+        panic!("a lease inside the request timeout must be refused");
+    };
+    assert_eq!(err.lease_ttl, Duration::from_secs(30));
+    assert_eq!(err.request_timeout, Duration::from_secs(60));
 }

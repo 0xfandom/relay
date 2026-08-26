@@ -14,7 +14,7 @@
 
 use std::{sync::OnceLock, time::Duration};
 
-use relay_dispatcher::{Limits, Reaper, ReaperConfig, Sender, SenderConfig};
+use relay_dispatcher::{Limits, Reaper, ReaperConfig, RequestLimits, Sender, SenderConfig};
 use relay_domain::{backoff::Backoff, breaker, rate_limit::Rate, url_guard::Policy};
 use relay_metrics::Exporter;
 use relay_store::Store;
@@ -53,6 +53,7 @@ fn config(breaker: Option<breaker::Policy>, rate_limit: bool) -> SenderConfig {
             retry_after_cap: Duration::from_secs(300),
         },
         policy: Policy::permissive(),
+        request: RequestLimits::default(),
         rate_limit,
         limits: Limits {
             max_in_flight: 1024,

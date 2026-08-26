@@ -15,7 +15,7 @@
 
 use std::time::{Duration, Instant};
 
-use relay_dispatcher::{Limits, Outcome, Pool, PoolConfig, Sender, SenderConfig};
+use relay_dispatcher::{Limits, Outcome, Pool, PoolConfig, RequestLimits, Sender, SenderConfig};
 use relay_domain::{backoff::Backoff, rate_limit::Rate, url_guard::Policy};
 use relay_store::Store;
 use relay_testkit::Receiver;
@@ -32,6 +32,7 @@ fn limited() -> SenderConfig {
             retry_after_cap: Duration::from_secs(300),
         },
         policy: Policy::permissive(),
+        request: RequestLimits::default(),
         rate_limit: true,
         // Breaker off: several of these tests fail one endpoint repeatedly on
         // purpose, and tripping it would replace the behaviour under test with a
@@ -326,6 +327,7 @@ async fn switching_the_limiter_off_removes_the_ceiling(pool: PgPool) {
     // The escape hatch, tested so that the tests which rely on it are relying on
     // something real. Off is a deliberate load-test setting, never a default.
     let unlimited = SenderConfig {
+        request: RequestLimits::default(),
         rate_limit: false,
         // Breaker off: several of these tests fail one endpoint repeatedly on
         // purpose, and tripping it would replace the behaviour under test with a

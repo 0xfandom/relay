@@ -14,7 +14,7 @@
 
 use std::{sync::Arc, time::Duration};
 
-use relay_dispatcher::{Pool, PoolConfig, Reaper, ReaperConfig, SenderConfig};
+use relay_dispatcher::{Pool, PoolConfig, Reaper, ReaperConfig, RequestLimits, SenderConfig};
 use relay_domain::url_guard::Policy;
 use relay_store::Store;
 use relay_testkit::Receiver;
@@ -249,6 +249,7 @@ fn local() -> SenderConfig {
         policy: Policy::permissive(),
         // Rate limiting off: these tests are about something else, and a deferral
         // would add attempt rows for requests that were never made.
+        request: RequestLimits::default(),
         rate_limit: false,
         // Breaker off: several of these tests fail one endpoint repeatedly on
         // purpose, and tripping it would replace the behaviour under test with a
