@@ -71,7 +71,9 @@ standing in for a customer endpoint.
 
 ```bash
 export DATABASE_URL=postgres://relay:relay@localhost:5433/relay
-# The receiver below runs on loopback, which the dispatcher refuses by default.
+# The receiver below is on loopback, over plain HTTP, on an odd port — all three
+# refused by default. This is the one switch that relaxes the whole posture, and
+# both processes read it, so registration and delivery agree.
 export RELAY_ALLOW_PRIVATE_ENDPOINTS=true
 
 RELAY_TESTKIT_SECRET=whsec_demo cargo run -p relay-testkit   # :9099
@@ -92,9 +94,10 @@ curl -X POST 127.0.0.1:8080/v1/events \
 # 202 Accepted, with the event id and one delivery id per subscribed endpoint
 ```
 
-The receiver exposes failure modes for testing delivery behaviour:
-`/always500`, `/slow?ms=`, `/flaky?pct=`, `/429?retry_after=`, and `/verify`,
-which checks the signature and the freshness window.
+The receiver exposes failure modes for testing delivery behaviour: `/always500`,
+`/slow?ms=`, `/flaky?pct=`, `/429?retry_after=`, `/bigbody?kb=`, `/trickle?ms=`
+(answers `200` and then dribbles its body forever), `/toggle`, and `/verify`, which
+checks the signature and the freshness window.
 
 ## Sending an event more than once
 
