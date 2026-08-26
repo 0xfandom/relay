@@ -4,6 +4,8 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
+# For the trickling response: a body that yields a byte at a time, forever.
+async-stream = "0.3.6"
 axum = "0.8.9"
 relay-domain = { version = "0.1.0", path = "../domain" }
 serde = { version = "1.0.229", features = ["derive"] }
