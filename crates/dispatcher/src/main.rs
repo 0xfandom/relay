@@ -34,13 +34,21 @@ async fn main() -> anyhow::Result<()> {
         interval: Duration::from_secs(env_usize("RELAY_REAP_INTERVAL_SECS", 10)? as u64),
     };
 
-    // How long a producer's retry is still recognised as a retry. Shortening it
-    // trades storage for a wider window in which a duplicate creates a second event.
+    // Four retention windows, because the four are kept for different reasons and a
+    // single number would have to satisfy the longest. The attempt log is a debugging
+    // aid measured in weeks; a dead letter is a webhook somebody is still owed.
     let pruner_config = PrunerConfig {
-        retention: Duration::from_secs(env_usize(
+        // Shortening this trades storage for a wider window in which a producer's
+        // retry creates a second event.
+        idempotency: Duration::from_secs(env_usize(
             "RELAY_IDEMPOTENCY_RETENTION_SECS",
             relay_domain::idempotency::RETENTION.as_secs() as usize,
         )? as u64),
+        attempts: Duration::from_secs(env_days("RELAY_ATTEMPT_RETENTION_DAYS", 30)?),
+        succeeded: Duration::from_secs(env_days("RELAY_SUCCEEDED_RETENTION_DAYS", 30)?),
+        dead: Duration::from_secs(env_days("RELAY_DEAD_RETENTION_DAYS", 90)?),
+        batch: env_usize("RELAY_RETENTION_BATCH", 5_000)? as i64,
+        partition_days_ahead: env_usize("RELAY_PARTITION_DAYS_AHEAD", 14)? as i32,
         interval: Duration::from_secs(env_usize("RELAY_PRUNE_INTERVAL_SECS", 3600)? as u64),
     };
 
@@ -147,7 +155,7 @@ async fn main() -> anyhow::Result<()> {
         batch_size = config.batch_size,
         db_connections,
         lease_ttl = ?reaper_config.lease_ttl,
-        idempotency_retention = ?pruner_config.retention,
+        retention = ?pruner_config,
         request = ?request,
         shutdown_deadline = ?config.shutdown_deadline,
         policy = ?policy,
@@ -238,6 +246,11 @@ async fn shutdown_signal() {
         _ = ctrl_c => {}
         _ = terminate => {}
     }
+}
+
+/// A retention window given in days, returned as seconds.
+fn env_days(key: &str, default: usize) -> anyhow::Result<u64> {
+    Ok(env_usize(key, default)? as u64 * 24 * 60 * 60)
 }
 
 fn env_usize(key: &str, default: usize) -> anyhow::Result<usize> {

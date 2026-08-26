@@ -31,7 +31,7 @@ use relay_domain::{
     rate_limit::{Rate, Take},
     url_guard::{Policy, Refused},
 };
-use relay_store::{AttemptResult, DeadReason, PendingDelivery, Store};
+use relay_store::{AttemptResult, DeadReason, DeliveryStatus, PendingDelivery, Store};
 use tokio::{sync::Semaphore, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
@@ -1626,24 +1626,73 @@ impl Reaper {
     }
 }
 
-/// How long an idempotency key is honoured, and how often expired ones are swept.
+/// How long each kind of history is kept, and how often the sweep runs.
+///
+/// Four windows rather than one, because the four are kept for different reasons and
+/// a single number would have to satisfy the longest. The attempt log is a debugging
+/// aid measured in weeks; a dead letter is money somebody is still owed and is kept
+/// for a quarter.
 #[derive(Debug, Clone)]
 pub struct PrunerConfig {
-    /// The retention window. A duplicate arriving after it creates a second event,
-    /// so this is a product decision as much as a storage one.
-    pub retention: Duration,
-    /// How often to sweep. Loose on purpose: a key that outlives its window by an
-    /// hour costs one row, while sweeping every ten seconds costs a scan.
+    /// How long an idempotency key is honoured. A duplicate arriving after it
+    /// creates a second event, so this is a product decision as much as a storage
+    /// one.
+    pub idempotency: Duration,
+    /// How long the attempt log is kept. Enforced by dropping whole daily
+    /// partitions, so this is rounded down to a day either way.
+    pub attempts: Duration,
+    /// How long a succeeded delivery's row is kept.
+    ///
+    /// Should not be shorter than `attempts`: deleting the delivery cascades into
+    /// the attempt log, and cascading row-by-row into partitions is exactly the
+    /// vacuum load the partitioning exists to avoid. Longer, and the partitions are
+    /// gone before the cascade can find anything.
+    pub succeeded: Duration,
+    /// How long a dead delivery is kept. Longer than the rest: it is a webhook
+    /// somebody is still owed, and the whole point of the dead letter queue is that
+    /// it can be replayed once the underlying problem is fixed.
+    pub dead: Duration,
+    /// How many rows one delete touches before the sweep yields.
+    ///
+    /// Bounded so the sweep never takes a long lock on the table the claim query
+    /// reads. The loop repeats until a pass deletes nothing.
+    pub batch: i64,
+    /// How far ahead daily partitions are created.
+    ///
+    /// Generous, and it costs one empty table per day. The window between "this
+    /// partition is needed" and "this partition exists" is the only way rows reach
+    /// the default partition, and pushing it out to weeks means this job can be
+    /// broken for a fortnight without consequence.
+    pub partition_days_ahead: i32,
+    /// How often to sweep. Loose on purpose: history that outlives its window by an
+    /// hour costs nothing, while sweeping every ten seconds costs a scan.
     pub interval: Duration,
 }
 
 impl Default for PrunerConfig {
     fn default() -> Self {
         Self {
-            retention: relay_domain::idempotency::RETENTION,
+            idempotency: relay_domain::idempotency::RETENTION,
+            attempts: Duration::from_secs(30 * DAY),
+            succeeded: Duration::from_secs(30 * DAY),
+            dead: Duration::from_secs(90 * DAY),
+            batch: 5_000,
+            partition_days_ahead: 14,
             interval: Duration::from_secs(3600),
         }
     }
+}
+
+const DAY: u64 = 24 * 60 * 60;
+
+/// What one sweep did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Swept {
+    pub partitions_created: i64,
+    pub partitions_dropped: Vec<String>,
+    pub succeeded_deleted: u64,
+    pub dead_deleted: u64,
+    pub keys_pruned: u64,
 }
 
 /// Deletes idempotency keys that have outlived their window.
@@ -1671,34 +1720,128 @@ impl Pruner {
         }
     }
 
-    /// Keys deleted since start.
+    /// Idempotency keys deleted since start.
     pub fn pruned(&self) -> u64 {
         self.pruned.load(Ordering::Relaxed)
     }
 
-    pub async fn prune_once(&self) -> Result<u64, SendError> {
-        let n = self
+    /// One full sweep: make partitions, drop partitions, delete rows, prune keys.
+    ///
+    /// The order is load-bearing. Partitions are created *first*, because a sweep
+    /// that fails halfway must not leave tomorrow without a table to write into —
+    /// that failure costs duplicate webhooks, and every other step here costs disk.
+    /// Dropping comes before the row deletes so the cascade from a deleted delivery
+    /// finds as few attempt rows as possible.
+    pub async fn prune_once(&self) -> Result<Swept, SendError> {
+        let partitions_created = self
             .store
-            .prune_idempotency_keys(self.config.retention)
+            .ensure_attempt_partitions(self.config.partition_days_ahead)
             .await?;
-        if n > 0 {
-            self.pruned.fetch_add(n, Ordering::Relaxed);
-            relay_metrics::keys_pruned(n);
-            // Info, not warn. Unlike the reaper's count, a non-zero number here is
-            // the system working.
+        if partitions_created > 0 {
             tracing::info!(
-                pruned = n,
-                retention = ?self.config.retention,
+                created = partitions_created,
+                days_ahead = self.config.partition_days_ahead,
+                "created attempt log partitions"
+            );
+        }
+
+        let partitions_dropped = self
+            .store
+            .drop_attempt_partitions(as_days(self.config.attempts))
+            .await?;
+        if !partitions_dropped.is_empty() {
+            // Info, not warn: this is the retention working. A partition drop frees
+            // the whole day at once, with no vacuum and almost no WAL.
+            tracing::info!(
+                dropped = ?partitions_dropped,
+                retention = ?self.config.attempts,
+                "dropped expired attempt log partitions"
+            );
+        }
+
+        let succeeded_deleted = self
+            .delete_in_batches(DeliveryStatus::Succeeded, self.config.succeeded)
+            .await?;
+        let dead_deleted = self
+            .delete_in_batches(DeliveryStatus::Dead, self.config.dead)
+            .await?;
+
+        let keys_pruned = self
+            .store
+            .prune_idempotency_keys(self.config.idempotency)
+            .await?;
+        if keys_pruned > 0 {
+            self.pruned.fetch_add(keys_pruned, Ordering::Relaxed);
+            relay_metrics::keys_pruned(keys_pruned);
+            tracing::info!(
+                pruned = keys_pruned,
+                retention = ?self.config.idempotency,
                 "deleted expired idempotency keys"
             );
         }
-        Ok(n)
+
+        // Should be zero forever. Anything here arrived while its own day had no
+        // partition, and the recovery is manual — a new partition cannot be created
+        // over a range the default already holds rows for.
+        match self.store.attempts_in_default_partition().await {
+            Ok(0) => {}
+            Ok(n) => tracing::error!(
+                rows = n,
+                "attempts landed in the default partition; they must be moved by hand \
+                 before that day's partition can be created"
+            ),
+            Err(e) => tracing::error!(error = %e, "could not read the default partition"),
+        }
+
+        Ok(Swept {
+            partitions_created,
+            partitions_dropped,
+            succeeded_deleted,
+            dead_deleted,
+            keys_pruned,
+        })
+    }
+
+    /// Delete terminal deliveries older than `older_than`, a batch at a time.
+    ///
+    /// Looping over bounded deletes rather than issuing one large one: a single
+    /// statement covering a month of history holds a transaction and a pile of row
+    /// locks on the table the claim query reads, and a delivery waiting behind a
+    /// retention sweep is a webhook arriving late for no reason a customer could
+    /// ever be told.
+    async fn delete_in_batches(
+        &self,
+        status: DeliveryStatus,
+        older_than: Duration,
+    ) -> Result<u64, SendError> {
+        let mut total = 0;
+        // Bounded, so a sweep cannot run until the next one is due. Whatever is left
+        // is taken by the following pass.
+        for _ in 0..1_000 {
+            let n = self
+                .store
+                .delete_deliveries(status, older_than, self.config.batch)
+                .await?;
+            total += n;
+            if n < self.config.batch as u64 {
+                break;
+            }
+        }
+        if total > 0 {
+            tracing::info!(
+                deleted = total,
+                status = status.as_str(),
+                retention = ?older_than,
+                "deleted expired deliveries"
+            );
+        }
+        Ok(total)
     }
 
     pub async fn run(&self, cancel: CancellationToken) {
         loop {
             if let Err(e) = self.prune_once().await {
-                tracing::error!(error = %e, "pruner failed");
+                tracing::error!(error = %e, "retention sweep failed");
             }
             tokio::select! {
                 _ = tokio::time::sleep(self.config.interval) => {}
@@ -1709,6 +1852,15 @@ impl Pruner {
             }
         }
     }
+}
+
+/// A retention window in whole days.
+///
+/// Rounded *up*, so a window is never shorter than configured. Partitions are daily,
+/// so the granularity is a day whatever the number says, and erring towards keeping
+/// data one day too long is the cheap direction to be wrong in.
+fn as_days(d: Duration) -> i32 {
+    d.as_secs().div_ceil(DAY).max(1) as i32
 }
 
 /// The `Relay-Signature` header value: every secret currently valid for this
