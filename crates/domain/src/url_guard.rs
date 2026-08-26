@@ -40,6 +40,14 @@ pub enum Refused {
     Internal(IpAddr),
     /// The host resolved to nothing at all.
     Unresolvable,
+    /// Plain `http` where the policy requires TLS.
+    ///
+    /// Separate from [`Refused::Scheme`] because it means something different: the
+    /// scheme is one a webhook receiver speaks, it is simply not one that keeps the
+    /// payload private on the way there.
+    Insecure,
+    /// A port outside the allow-list.
+    Port(u16),
 }
 
 /// Implemented so this can be returned from an HTTP client's resolver hook, which
@@ -54,6 +62,8 @@ impl std::fmt::Display for Refused {
             Self::NoHost => write!(f, "refused: url has no host"),
             Self::Internal(ip) => write!(f, "refused: {ip} is not a public address"),
             Self::Unresolvable => write!(f, "refused: host does not resolve"),
+            Self::Insecure => write!(f, "refused: https is required"),
+            Self::Port(p) => write!(f, "refused: port {p} is not permitted"),
         }
     }
 }
@@ -63,27 +73,138 @@ impl std::fmt::Display for Refused {
 /// `Default` is the strict policy. That is deliberate and load-bearing: a permissive
 /// default is a vulnerability that ships whenever somebody forgets to configure it,
 /// which is always. Callers that need loopback have to say so.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Which destination ports a delivery may use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ports {
+    /// Anything. Right for development, where every receiver is on an ephemeral
+    /// port.
+    Any,
+    /// Only these. `443` in production, and the reason is narrower than it looks:
+    /// the addresses that survive the range check are public ones, but a public
+    /// address plus an arbitrary port is still a port scanner. An endpoint URL is a
+    /// place to *receive webhooks*, and a webhook receiver listens where webhook
+    /// receivers listen.
+    Only(Vec<u16>),
+}
+
+impl Ports {
+    fn permits(&self, port: u16) -> bool {
+        match self {
+            Ports::Any => true,
+            Ports::Only(ok) => ok.contains(&port),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Policy {
     /// Permit private, loopback and link-local addresses.
     ///
     /// Off in production, on for local development and tests, where every receiver
     /// is on `127.0.0.1` and would otherwise be refused.
     pub allow_private: bool,
+    /// Refuse plain `http`.
+    ///
+    /// The signature proves who sent a payload and that nobody altered it. It does
+    /// nothing at all to keep it private, so a webhook carrying a customer's order
+    /// over `http` is readable by every hop between here and there.
+    pub require_https: bool,
+    /// Which destination ports are permitted.
+    pub ports: Ports,
+}
+
+/// The strict policy: public addresses, TLS, and the port TLS lives on.
+///
+/// A permissive default is a vulnerability that ships whenever somebody forgets to
+/// configure it, which is always. Callers that need loopback have to say so.
+impl Default for Policy {
+    fn default() -> Self {
+        Self {
+            allow_private: false,
+            require_https: true,
+            ports: Ports::Only(vec![443]),
+        }
+    }
 }
 
 impl Policy {
-    /// For local development and tests, where receivers live on loopback.
+    /// For local development and tests, where receivers live on loopback, speak
+    /// plain HTTP and listen wherever the OS gave them a socket.
     pub fn permissive() -> Self {
         Self {
             allow_private: true,
+            require_https: false,
+            ports: Ports::Any,
         }
+    }
+
+    /// Read the policy from the environment.
+    ///
+    /// The lookup is a parameter rather than a direct `std::env` read so this stays
+    /// a pure function of its input, testable without touching process-wide state —
+    /// [`Policy::from_env`] is the one-line wrapper that does touch it.
+    ///
+    /// It lives here, in the crate that performs no I/O, for one reason: the API and
+    /// the dispatcher both need it, and a divergence between what registration
+    /// accepts and what the send path allows is precisely the failure this module
+    /// exists to prevent. One definition, two readers.
+    ///
+    /// `RELAY_ALLOW_PRIVATE_ENDPOINTS` is the development switch, and the other two
+    /// follow it unless set explicitly: a laptop's receivers are on loopback, over
+    /// plain HTTP, on whatever port the OS handed out, and needing three variables to
+    /// say "this is a laptop" means somebody eventually sets the first one in
+    /// production to make an error go away.
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
+        let flag = |key: &str, default: bool| match get(key).as_deref() {
+            Some("true" | "1") => true,
+            Some("false" | "0") => false,
+            _ => default,
+        };
+
+        let allow_private = flag("RELAY_ALLOW_PRIVATE_ENDPOINTS", false);
+        let require_https = flag("RELAY_REQUIRE_HTTPS", !allow_private);
+        let ports = match get("RELAY_ALLOWED_PORTS").as_deref() {
+            Some("*") => Ports::Any,
+            Some(list) => Ports::Only(
+                list.split(',')
+                    .filter_map(|p| p.trim().parse().ok())
+                    .collect(),
+            ),
+            None if allow_private => Ports::Any,
+            None => Ports::Only(vec![443]),
+        };
+
+        Self {
+            allow_private,
+            require_https,
+            ports,
+        }
+    }
+
+    /// [`Policy::from_lookup`], reading the real environment.
+    pub fn from_env() -> Self {
+        Self::from_lookup(|k| std::env::var(k).ok())
     }
 
     pub fn check_scheme(&self, scheme: &str) -> Result<(), Refused> {
         match scheme {
-            "http" | "https" => Ok(()),
+            "https" => Ok(()),
+            "http" if self.require_https => Err(Refused::Insecure),
+            "http" => Ok(()),
             other => Err(Refused::Scheme(other.to_string())),
+        }
+    }
+
+    /// Check the port a delivery would connect to.
+    ///
+    /// Checked against the port the URL resolves to rather than the one it writes
+    /// down: `https://host/` and `https://host:443/` are the same destination, and
+    /// only one of them says so.
+    pub fn check_port(&self, port: u16) -> Result<(), Refused> {
+        if self.ports.permits(port) {
+            Ok(())
+        } else {
+            Err(Refused::Port(port))
         }
     }
 
@@ -289,20 +410,93 @@ mod tests {
 
     #[test]
     fn only_http_and_https_are_accepted() {
-        assert!(strict().check_scheme("http").is_ok());
-        assert!(strict().check_scheme("https").is_ok());
         for s in ["file", "gopher", "ftp", "redis", "data", "jar"] {
             assert_eq!(
                 strict().check_scheme(s),
                 Err(Refused::Scheme(s.to_string())),
                 "{s} should be refused"
             );
+            assert_eq!(
+                Policy::permissive().check_scheme(s),
+                Err(Refused::Scheme(s.to_string())),
+                "{s} should be refused even permissively"
+            );
         }
     }
 
     #[test]
-    fn the_permissive_policy_only_relaxes_addresses() {
-        // Local development needs loopback receivers. It does not need `file://`.
+    fn plain_http_is_refused_when_tls_is_required() {
+        assert!(strict().check_scheme("https").is_ok());
+        // A different refusal from an unknown scheme, because it is a different
+        // problem: `http` is a scheme a receiver speaks, it just does not keep the
+        // payload private on the way there. The signature proves who sent it and
+        // that nobody changed it, and says nothing about who else read it.
+        assert_eq!(strict().check_scheme("http"), Err(Refused::Insecure));
+        assert!(Policy::permissive().check_scheme("http").is_ok());
+    }
+
+    #[test]
+    fn only_permitted_ports_are_reachable() {
+        assert!(strict().check_port(443).is_ok());
+        // A public address on an arbitrary port is still a port scanner, and an
+        // endpoint URL is a place to receive webhooks.
+        assert_eq!(strict().check_port(22), Err(Refused::Port(22)));
+        assert_eq!(strict().check_port(6379), Err(Refused::Port(6379)));
+        assert!(Policy::permissive().check_port(51023).is_ok());
+    }
+
+    #[test]
+    fn the_development_switch_relaxes_the_whole_posture() {
+        // One switch, not three. A laptop's receivers are on loopback, over plain
+        // HTTP, on whatever port the OS handed out — and if saying "this is a
+        // laptop" took three variables, somebody would eventually set the first one
+        // in production to make an error go away.
+        let dev = Policy::from_lookup(|k| {
+            (k == "RELAY_ALLOW_PRIVATE_ENDPOINTS").then(|| "true".to_string())
+        });
+        assert_eq!(dev, Policy::permissive());
+
+        // Nothing set at all is the strict policy.
+        assert_eq!(Policy::from_lookup(|_| None), Policy::default());
+    }
+
+    #[test]
+    fn each_part_of_the_policy_can_still_be_set_on_its_own() {
+        let p = Policy::from_lookup(|k| match k {
+            // A staging deployment: real addresses, but a receiver on 8443.
+            "RELAY_ALLOWED_PORTS" => Some("443,8443".to_string()),
+            _ => None,
+        });
+        assert!(!p.allow_private);
+        assert!(p.require_https);
+        assert!(p.check_port(8443).is_ok());
+        assert_eq!(p.check_port(80), Err(Refused::Port(80)));
+
+        // And the development switch does not override an explicit tightening.
+        let p = Policy::from_lookup(|k| match k {
+            "RELAY_ALLOW_PRIVATE_ENDPOINTS" => Some("true".to_string()),
+            "RELAY_REQUIRE_HTTPS" => Some("true".to_string()),
+            _ => None,
+        });
+        assert!(p.allow_private);
+        assert!(p.require_https);
+    }
+
+    #[test]
+    fn an_unparseable_port_list_is_not_silently_permissive() {
+        // The dangerous failure would be reading `RELAY_ALLOWED_PORTS=four hundred`
+        // as "no restriction". An empty list refuses everything, which is loud and
+        // gets fixed; a permissive one is silent and does not.
+        let p = Policy::from_lookup(|k| {
+            (k == "RELAY_ALLOWED_PORTS").then(|| "four hundred".to_string())
+        });
+        assert_eq!(p.check_port(443), Err(Refused::Port(443)));
+    }
+
+    #[test]
+    fn the_permissive_policy_still_refuses_schemes_nobody_speaks() {
+        // Local development needs loopback receivers, plain HTTP and odd ports. It
+        // does not need `file://`, which is not a webhook and does read local files.
         assert!(Policy::permissive().check_addrs(&[ip("127.0.0.1")]).is_ok());
         assert!(Policy::permissive().check_scheme("file").is_err());
     }
