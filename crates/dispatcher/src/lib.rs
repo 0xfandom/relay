@@ -124,7 +124,7 @@ struct GuardedResolver {
 
 impl reqwest::dns::Resolve for GuardedResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let policy = self.policy;
+        let policy = self.policy.clone();
         Box::pin(async move {
             let addrs = resolve_host(name.as_str(), 0).await;
             let ips: Vec<IpAddr> = addrs.iter().map(|a| a.ip()).collect();
@@ -240,7 +240,7 @@ impl Sender {
             // up pointing at an internal address.
             .redirect(reqwest::redirect::Policy::none())
             .dns_resolver(Arc::new(GuardedResolver {
-                policy: config.policy,
+                policy: config.policy.clone(),
             }))
             .build()
             .expect("reqwest client builds with static configuration");
@@ -286,8 +286,17 @@ impl Sender {
     async fn check_destination(&self, url: &str) -> Result<(), Refused> {
         let parsed = reqwest::Url::parse(url).map_err(|_| Refused::NoHost)?;
         self.config.policy.check_scheme(parsed.scheme())?;
-        let host = parsed.host_str().ok_or(Refused::NoHost)?;
+        // An empty host as well as a missing one. Refusing it by name rather than
+        // letting it fall through to "resolved to nothing" keeps the error honest.
+        let host = parsed
+            .host_str()
+            .filter(|h| !h.is_empty())
+            .ok_or(Refused::NoHost)?;
         let port = parsed.port_or_known_default().unwrap_or(80);
+        // Checked against the port that will actually be connected to rather than
+        // the one the URL writes down: `https://host/` and `https://host:443/` are
+        // the same destination and only one of them says so.
+        self.config.policy.check_port(port)?;
 
         let addrs = resolve_host(host, port).await;
         let ips: Vec<IpAddr> = addrs.iter().map(|a| a.ip()).collect();
@@ -485,7 +494,7 @@ impl Sender {
                 p.delivery_id,
                 p.attempt,
                 AttemptResult::Dead {
-                    reason: DeadReason::PermanentFailure,
+                    reason: DeadReason::Refused,
                 },
                 None,
                 0,
@@ -504,7 +513,7 @@ impl Sender {
         // and a zero in the latency histogram would drag the median of every panel
         // that reads it towards a request that never happened.
         relay_metrics::attempt(Disposition::Permanent.as_str());
-        relay_metrics::dead(DeadReason::PermanentFailure.as_str());
+        relay_metrics::dead(DeadReason::Refused.as_str());
         relay_metrics::refused();
         Ok(Outcome::Failed {
             class: Class::Permanent,

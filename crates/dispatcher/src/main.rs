@@ -44,14 +44,17 @@ async fn main() -> anyhow::Result<()> {
         interval: Duration::from_secs(env_usize("RELAY_PRUNE_INTERVAL_SECS", 3600)? as u64),
     };
 
-    // Off unless explicitly enabled. Relay will make an HTTP request to any URL a
-    // customer registers, from inside a private network, so allowing internal
-    // addresses turns it into a server-side request forgery engine — the cloud
-    // metadata service answers without authentication to anything on the box.
-    // Local development needs it, because every receiver is on loopback there.
-    let allow_private = std::env::var("RELAY_ALLOW_PRIVATE_ENDPOINTS")
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false);
+    // Where deliveries are allowed to go: which addresses, which scheme, which
+    // ports. Strict unless explicitly relaxed, and read from one place shared with
+    // the API — a divergence between what registration accepts and what the send
+    // path allows is the whole failure mode this guards against.
+    //
+    // Relay will make an HTTP request to any URL a customer registers, from inside a
+    // private network, so a permissive policy turns it into a server-side request
+    // forgery engine — the cloud metadata service answers without authentication to
+    // anything on the box.
+    let policy = Policy::from_env();
+    let allow_private = policy.allow_private;
     // Off only for a deliberate load test. A limiter that has to be switched on
     // protects nobody, and the thing it protects is somebody else's server.
     let rate_limit = std::env::var("RELAY_RATE_LIMIT")
@@ -87,7 +90,7 @@ async fn main() -> anyhow::Result<()> {
 
     let sender_config = SenderConfig {
         backoff: Default::default(),
-        policy: Policy { allow_private },
+        policy: policy.clone(),
         rate_limit,
         limits,
         breaker,
@@ -127,7 +130,7 @@ async fn main() -> anyhow::Result<()> {
         idempotency_retention = ?pruner_config.retention,
         request_timeout = ?REQUEST_TIMEOUT,
         shutdown_deadline = ?config.shutdown_deadline,
-        allow_private_endpoints = allow_private,
+        policy = ?policy,
         rate_limit,
         max_in_flight = limits.max_in_flight,
         max_per_endpoint = limits.per_endpoint,
