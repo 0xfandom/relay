@@ -18,7 +18,21 @@ async fn main() -> anyhow::Result<()> {
     // the authority is worse than none: it accepts URLs that will never deliver.
     let policy = relay_domain::url_guard::Policy::from_env();
     tracing::info!(?policy, "endpoint policy");
-    let state = AppState { store, policy };
+    // Kept in step with the dispatcher's payload cap. Ingest accepting more than
+    // delivery will send would mean answering `202` to events that are guaranteed to
+    // fail permanently.
+    let max_body_bytes = match std::env::var("RELAY_MAX_PAYLOAD_BYTES") {
+        Ok(v) => v.parse().map_err(|_| {
+            anyhow::anyhow!("RELAY_MAX_PAYLOAD_BYTES must be a byte count, got {v:?}")
+        })?,
+        Err(_) => relay_api::extract::MAX_BODY_BYTES,
+    };
+
+    let state = AppState {
+        store,
+        policy,
+        max_body_bytes,
+    };
 
     // Logged and carried on rather than fatal. An API that refuses to accept events
     // because it could not install a counter has turned a missing dashboard into a

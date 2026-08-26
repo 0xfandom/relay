@@ -34,6 +34,12 @@ pub struct AppState {
     /// time is a delivery that dies in the dead letter queue for a reason the caller
     /// was never told at the point they could have fixed it.
     pub policy: Policy,
+    /// Largest body `POST /v1/events` will accept.
+    ///
+    /// Should match the dispatcher's `max_payload_bytes`. If ingest accepts more than
+    /// delivery will send, the difference is a set of events that are stored, fanned
+    /// out, and then permanently fail — accepted with a `202` that was a lie.
+    pub max_body_bytes: usize,
 }
 
 impl AppState {
@@ -43,6 +49,7 @@ impl AppState {
         Self {
             store,
             policy: Policy::default(),
+            max_body_bytes: extract::MAX_BODY_BYTES,
         }
     }
 
@@ -51,6 +58,7 @@ impl AppState {
         Self {
             store,
             policy: Policy::permissive(),
+            max_body_bytes: extract::MAX_BODY_BYTES,
         }
     }
 }

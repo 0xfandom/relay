@@ -20,23 +20,28 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-/// Maximum accepted body size. Without a cap, one large request can exhaust
+use crate::AppState;
+
+/// Default maximum accepted body size. Without a cap, one large request can exhaust
 /// memory — the body is buffered before the handler ever runs.
 pub const MAX_BODY_BYTES: usize = 256 * 1024;
 
 pub struct RawBody(pub Bytes);
 
 pub enum RawBodyRejection {
-    TooLarge,
+    /// Carries the cap it exceeded, so the caller is told what to fit inside rather
+    /// than left to guess. The number is configurable, so a constant in the message
+    /// would eventually be a lie.
+    TooLarge(usize),
     Unreadable,
 }
 
 impl IntoResponse for RawBodyRejection {
     fn into_response(self) -> Response {
         match self {
-            Self::TooLarge => (
+            Self::TooLarge(cap) => (
                 StatusCode::PAYLOAD_TOO_LARGE,
-                format!("body exceeds {MAX_BODY_BYTES} bytes"),
+                format!("body exceeds {cap} bytes"),
             ),
             Self::Unreadable => (
                 StatusCode::BAD_REQUEST,
@@ -47,13 +52,16 @@ impl IntoResponse for RawBodyRejection {
     }
 }
 
-impl<S> FromRequest<S> for RawBody
-where
-    S: Send + Sync,
-{
+/// Bound to [`AppState`] rather than generic over any state.
+///
+/// It has to read the configured cap from somewhere, and taking it from the state
+/// the router already carries is better than a process-global: a test can vary it,
+/// and the value the handler enforces is visibly the same one the binary configured.
+impl FromRequest<AppState> for RawBody {
     type Rejection = RawBodyRejection;
 
-    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+    async fn from_request(req: Request, state: &AppState) -> Result<Self, Self::Rejection> {
+        let cap = state.max_body_bytes;
         // Reject on the declared length before reading anything, so an oversized
         // body is refused rather than buffered.
         if let Some(len) = req
@@ -61,9 +69,9 @@ where
             .get(axum::http::header::CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<usize>().ok())
-            && len > MAX_BODY_BYTES
+            && len > cap
         {
-            return Err(RawBodyRejection::TooLarge);
+            return Err(RawBodyRejection::TooLarge(cap));
         }
 
         let bytes = Bytes::from_request(req, state)
@@ -71,8 +79,8 @@ where
             .map_err(|_| RawBodyRejection::Unreadable)?;
 
         // A missing or lying Content-Length is still caught here.
-        if bytes.len() > MAX_BODY_BYTES {
-            return Err(RawBodyRejection::TooLarge);
+        if bytes.len() > cap {
+            return Err(RawBodyRejection::TooLarge(cap));
         }
 
         Ok(RawBody(bytes))
