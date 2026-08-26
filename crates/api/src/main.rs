@@ -28,10 +28,21 @@ async fn main() -> anyhow::Result<()> {
         Err(_) => relay_api::extract::MAX_BODY_BYTES,
     };
 
+    // The customer's whole deployment has to fit inside this. Shorter than the time
+    // it takes to notice a rotation, change a config and roll a fleet means the
+    // window expires mid-migration — the outage the overlap exists to prevent.
+    let secret_overlap = match std::env::var("RELAY_SECRET_OVERLAP_SECS") {
+        Ok(v) => std::time::Duration::from_secs(v.parse().map_err(|_| {
+            anyhow::anyhow!("RELAY_SECRET_OVERLAP_SECS must be a number of seconds, got {v:?}")
+        })?),
+        Err(_) => relay_api::DEFAULT_SECRET_OVERLAP,
+    };
+
     let state = AppState {
         store,
         policy,
         max_body_bytes,
+        secret_overlap,
     };
 
     // Logged and carried on rather than fatal. An API that refuses to accept events
