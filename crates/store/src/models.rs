@@ -8,13 +8,50 @@ use serde::Serialize;
 use sqlx::FromRow;
 use uuid::Uuid;
 
+/// A signing secret.
+///
+/// A newtype rather than a `String`, and the whole value of it is what it refuses to
+/// do: it has no `Display`, and its `Debug` prints `<redacted>`. Reading the actual
+/// bytes takes [`Secret::expose`], which is deliberately awkward to type and trivial
+/// to grep for at review time.
+///
+/// The alternative is a rule people have to remember, and the failure mode of that
+/// rule is one `{secret}` in a log line written during an incident, after which
+/// every customer has to be told to change their verification key.
+#[derive(Clone, PartialEq, Eq, sqlx::Type)]
+#[sqlx(transparent)]
+pub struct Secret(String);
+
+impl Secret {
+    pub fn new(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+
+    /// The bytes to sign with. Named so that using it is a visible act.
+    pub fn expose(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+
+    /// The secret as a string, for the one place it is legitimately handed out: the
+    /// response to creating or rotating an endpoint.
+    pub fn reveal(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(<redacted>)")
+    }
+}
+
 #[derive(Clone, FromRow, Serialize)]
 pub struct Endpoint {
     pub id: Uuid,
     pub url: String,
     /// Never serialise this to a client. It is returned exactly once, at creation.
     #[serde(skip_serializing)]
-    pub secret: String,
+    pub secret: Secret,
     pub event_types: Vec<String>,
     pub enabled: bool,
 }
@@ -111,7 +148,14 @@ pub struct PendingDelivery {
     pub raw_payload: Vec<u8>,
     pub endpoint_id: Uuid,
     pub url: String,
-    pub secret: String,
+    pub secret: Secret,
+    /// The secret being rotated away from, while its overlap window is open.
+    ///
+    /// Both signatures go out together during the window, so there is no instant at
+    /// which the receiver's choice of secret is wrong. `None` once the window has
+    /// closed — decided by the query rather than by a sweeper, so a pruner that
+    /// stopped running cannot quietly keep an old secret alive.
+    pub previous_secret: Option<Secret>,
     /// The endpoint's configured rate, carried on the claim so the sender needs no
     /// second query to decide whether it is allowed to send yet.
     pub rate_per_second: f64,
@@ -161,7 +205,8 @@ impl std::fmt::Debug for PendingDelivery {
             .field("raw_payload_bytes", &self.raw_payload.len())
             .field("endpoint_id", &self.endpoint_id)
             .field("url", &self.url)
-            .field("secret", &"<redacted>")
+            .field("secret", &self.secret)
+            .field("previous_secret", &self.previous_secret)
             .field("rate_per_second", &self.rate_per_second)
             .field("burst", &self.burst)
             .field("breaker_state", &self.breaker_state)
@@ -177,7 +222,7 @@ impl std::fmt::Debug for Endpoint {
         f.debug_struct("Endpoint")
             .field("id", &self.id)
             .field("url", &self.url)
-            .field("secret", &"<redacted>")
+            .field("secret", &self.secret)
             .field("event_types", &self.event_types)
             .field("enabled", &self.enabled)
             .finish()
