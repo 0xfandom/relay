@@ -5,7 +5,7 @@
 //! wait for any customer endpoint, because a customer endpoint may take thirty
 //! seconds or hang forever, and the caller must not inherit that latency.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::{
     Json, Router,
@@ -40,7 +40,17 @@ pub struct AppState {
     /// delivery will send, the difference is a set of events that are stored, fanned
     /// out, and then permanently fail — accepted with a `202` that was a lie.
     pub max_body_bytes: usize,
+    /// How long both signatures are sent after a rotation.
+    ///
+    /// The customer's whole deployment has to fit inside it, so it is measured in
+    /// hours rather than minutes: a window shorter than the time it takes to notice
+    /// the rotation, change a config and roll a fleet is a window that expires
+    /// mid-migration, which is the outage the overlap exists to prevent.
+    pub secret_overlap: Duration,
 }
+
+/// Long enough for a customer to notice, change a value and deploy.
+pub const DEFAULT_SECRET_OVERLAP: Duration = Duration::from_secs(24 * 60 * 60);
 
 impl AppState {
     /// The strict policy. Tests that are not about the guard use this; the binary
@@ -50,6 +60,7 @@ impl AppState {
             store,
             policy: Policy::default(),
             max_body_bytes: extract::MAX_BODY_BYTES,
+            secret_overlap: DEFAULT_SECRET_OVERLAP,
         }
     }
 
@@ -59,6 +70,7 @@ impl AppState {
             store,
             policy: Policy::permissive(),
             max_body_bytes: extract::MAX_BODY_BYTES,
+            secret_overlap: DEFAULT_SECRET_OVERLAP,
         }
     }
 }
@@ -67,6 +79,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/endpoints", post(create_endpoint))
+        .route("/v1/endpoints/{id}/rotate-secret", post(rotate_secret))
         .route(
             "/v1/events",
             // Timed from outside the handler rather than inside it, so the
@@ -253,6 +266,48 @@ fn generate_secret() -> String {
     let mut bytes = [0u8; 32];
     rand::rng().fill(&mut bytes);
     format!("whsec_{}", hex::encode(bytes))
+}
+
+#[derive(Serialize)]
+pub struct RotatedSecret {
+    pub id: uuid::Uuid,
+    /// Returned exactly once, like the secret at creation.
+    pub secret: String,
+    /// When the old secret stops being sent. Until then both signatures go out and
+    /// the receiver may switch at any moment.
+    pub previous_secret_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// `POST /v1/endpoints/{id}/rotate-secret`
+///
+/// The old secret keeps signing alongside the new one until the window closes, so
+/// there is no instant at which the receiver's choice is wrong. Without that, a
+/// rotation is a cutover: whichever side changes first is rejected by the other
+/// until it catches up, and the customer cannot fix it by deploying faster.
+///
+/// Rotating twice inside one window discards the secret from the first rotation.
+/// That is deliberate — the number of keys that can sign as you is exactly the
+/// number a rotation exists to keep at one.
+async fn rotate_secret(
+    State(state): State<AppState>,
+    Path(id): Path<uuid::Uuid>,
+) -> Result<Response, ApiError> {
+    let secret = generate_secret();
+    state
+        .store
+        .rotate_secret(id, &secret, state.secret_overlap)
+        .await?;
+    let rotation = state.store.secret_rotation(id).await?;
+
+    Ok((
+        StatusCode::OK,
+        Json(RotatedSecret {
+            id,
+            secret,
+            previous_secret_expires_at: rotation.expires_at,
+        }),
+    )
+        .into_response())
 }
 
 // --------------------------------------------------------------------- events
@@ -565,6 +620,12 @@ impl IntoResponse for ApiError {
         let (status, msg) = match &self {
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m.clone()),
             ApiError::NotFound(m) => (StatusCode::NOT_FOUND, m.clone()),
+            // Rotating an endpoint that does not exist is the caller's mistake, not
+            // ours, and a `500` would have them retry it forever.
+            ApiError::Store(relay_store::StoreError::EndpointNotFound) => (
+                StatusCode::NOT_FOUND,
+                "no endpoint with that id".to_string(),
+            ),
             // The caller reused one key for two different requests. Their bug, and
             // one they can only fix if we say so — answering with the first
             // request's result instead would drop the second event while looking
