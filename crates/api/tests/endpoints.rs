@@ -111,3 +111,70 @@ async fn a_url_with_no_authority_is_refused(pool: PgPool) {
     let (status, _) = register(addr, "https:///hook").await;
     assert_eq!(status, 201);
 }
+
+// ------------------------------------------------------------------ body cap
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn a_body_over_the_cap_is_refused_before_it_is_buffered(pool: PgPool) {
+    let mut state = AppState::permissive(Store::from_pool(pool));
+    state.max_body_bytes = 1024;
+    let addr = serve(state).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/events"))
+        .header("content-type", "application/json")
+        .header("relay-event-type", "order.paid")
+        .body(vec![b'x'; 4096])
+        .send()
+        .await
+        .expect("post");
+
+    assert_eq!(resp.status(), 413);
+    // The cap is configurable, so the message has to carry the number in force
+    // rather than a constant that stopped being true.
+    assert!(
+        resp.text().await.unwrap_or_default().contains("1024"),
+        "the rejection should name the limit"
+    );
+}
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn a_lying_content_length_does_not_get_past_the_cap(pool: PgPool) {
+    let mut state = AppState::permissive(Store::from_pool(pool));
+    state.max_body_bytes = 1024;
+    let addr = serve(state).await;
+
+    // Chunked, so there is no `Content-Length` to check up front. The declared-length
+    // check is an optimisation — it refuses without buffering — and cannot be the
+    // only one, because the sender chooses what to declare.
+    let big = vec![b'x'; 4096];
+    let stream = futures_util::stream::once(async move { Ok::<_, std::io::Error>(big) });
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/events"))
+        .header("content-type", "application/json")
+        .header("relay-event-type", "order.paid")
+        .body(reqwest::Body::wrap_stream(stream))
+        .send()
+        .await
+        .expect("post");
+
+    assert_eq!(resp.status(), 413);
+}
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn a_body_inside_the_cap_is_accepted(pool: PgPool) {
+    let mut state = AppState::permissive(Store::from_pool(pool));
+    state.max_body_bytes = 1024;
+    let addr = serve(state).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/events"))
+        .header("content-type", "application/json")
+        .header("relay-event-type", "order.paid")
+        .body(vec![b'x'; 512])
+        .send()
+        .await
+        .expect("post");
+
+    assert_eq!(resp.status(), 202);
+}

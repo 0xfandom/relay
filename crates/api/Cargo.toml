@@ -24,6 +24,9 @@ uuid = "1.24.0"
 # The concurrency test drives the real router over a real socket: 100 simultaneous
 # requests through axum's own extractors is the only way to prove that losing the
 # race never reaches the caller as a 5xx.
+futures-util = { version = "0.3.31", default-features = false }
 relay-testkit = { path = "../testkit" }
-reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "charset"] }
+# `stream` for the chunked-body test: a request with no Content-Length is the
+# only way to prove the cap does not rely on the sender declaring its size.
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "charset", "stream"] }
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "postgres", "uuid", "chrono", "migrate", "macros"] }
