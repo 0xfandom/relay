@@ -561,6 +561,55 @@ and nothing reports why.
 operation and exists for the case that is not normal — a cap lowered after rows were
 already stored under the old one, which would otherwise retry forever.
 
+## Keeping the database from growing forever
+
+The attempt log is the only table that grows with *traffic* rather than with
+customers: every delivery writes a row and a failing one writes twelve. At any real
+volume it is the largest object in the database by an order of magnitude.
+
+The obvious retention is `DELETE FROM delivery_attempts WHERE at < now() - 30 days`,
+and it is the wrong tool by a wide margin. Deleting a row does not free its space —
+it marks the row dead and leaves autovacuum to reclaim it — so a bulk delete
+produces a long vacuum on the busiest table in the system, a write-ahead log record
+per row, and index bloat that outlives the vacuum. Run it daily and the vacuum never
+catches up.
+
+So `delivery_attempts` is partitioned by day, and retention is `DROP TABLE`. That
+unlinks files: O(1), no vacuum, almost no WAL.
+
+| What | Default | Env | How |
+| --- | --- | --- | --- |
+| Attempt log | 30 days | `RELAY_ATTEMPT_RETENTION_DAYS` | Partition drop |
+| Succeeded deliveries | 30 days | `RELAY_SUCCEEDED_RETENTION_DAYS` | Batched delete |
+| Dead letters | 90 days | `RELAY_DEAD_RETENTION_DAYS` | Batched delete |
+| Idempotency keys | 24 hours | `RELAY_IDEMPOTENCY_RETENTION_SECS` | Batched delete |
+
+Four windows, because the four are kept for different reasons and one number would
+have to satisfy the longest. A dead letter is a webhook somebody is still owed, and
+the point of the queue is that it can be replayed once the underlying problem is
+fixed — so it outlives the successes by design. A `pending` delivery is never
+deleted at any age: it is still owed.
+
+Row deletes are batched and looped rather than issued as one large statement. A
+single delete covering a month of history holds a transaction and a pile of row
+locks on the table the claim query reads, and a delivery waiting behind a retention
+sweep is a webhook arriving late for a reason no customer could ever be told.
+
+### The default partition
+
+There is one, it is meant to stay empty, and it exists because the alternative is
+worse. Without it, an insert whose day has no partition *fails* — and that insert is
+the same transaction that records a delivery's outcome, so the delivery would be
+retried and the endpoint would receive it twice.
+
+The trap is that once a row lands there, `CREATE TABLE ... PARTITION OF` for that day
+fails permanently: Postgres refuses to create a partition covering rows the default
+already holds. A naive maintainer can never catch up. So partitions are seeded by the
+migration itself, created a fortnight ahead on every sweep, and the maintainer
+recovers by detaching the default, creating the partition, moving the rows and
+re-attaching — all in one transaction. `relay_attempt_default_partition_rows` is the
+metric to alert on rather than graph.
+
 ## Reading the logs
 
 Both binaries emit JSON when their stderr is a pipe and human-readable text when it
