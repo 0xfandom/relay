@@ -37,7 +37,7 @@ async fn store() -> Store {
 async fn spawn_api(store: Store) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = router(AppState { store });
+    let app = router(AppState::permissive(store));
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
