@@ -8,7 +8,7 @@
   "timezone": "browser",
   "editable": false,
   "schemaVersion": 39,
-  "version": 1,
+  "version": 2,
   "refresh": "10s",
   "time": {
     "from": "now-30m",
@@ -1240,6 +1240,161 @@
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by (le) (rate(relay_delivery_duration_seconds_bucket[5m])))",
           "legendFormat": "delivery p95",
+          "range": true,
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 23,
+      "type": "row",
+      "title": "Storage (M8)",
+      "description": "The attempt log is the only table that grows with traffic rather than with customers. Retention drops whole daily partitions, which is why these lines should be flat rather than sawtoothed.",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 59,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 24,
+      "type": "timeseries",
+      "title": "Disk by table",
+      "description": "Indexes and TOAST included, because those are disk too. A table whose data is small and whose indexes are enormous still fills the volume. The attempt log should plateau once retention starts dropping partitions; anything still climbing after a month is a window that is not being enforced.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "relay-prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 60,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "relay-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "relay_table_bytes",
+          "legendFormat": "{{table}}",
+          "range": true,
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 25,
+      "type": "timeseries",
+      "title": "Attempt log partitions",
+      "description": "Partitions should sit at roughly the retention window plus the margin created ahead. The second line is the one to alert on rather than graph: it should be zero forever. Anything there arrived while its own day had no partition \u2014 the maintainer recovers automatically, but a non-zero reading between sweeps means it has been late.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "relay-prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 60,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "relay-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "relay_attempt_partitions",
+          "legendFormat": "daily partitions",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "relay-prometheus"
+          },
+          "editorMode": "code",
+          "expr": "relay_attempt_default_partition_rows",
+          "legendFormat": "rows stranded in the default partition",
           "range": true,
           "refId": "B"
         }
