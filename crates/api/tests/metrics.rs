@@ -33,7 +33,7 @@ fn exporter() -> Exporter {
 async fn serve(store: Store) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = router_with_metrics(AppState { store }, exporter());
+    let app = router_with_metrics(AppState::permissive(store), exporter());
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });

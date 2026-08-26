@@ -16,7 +16,10 @@
 use std::time::Duration;
 
 use relay_dispatcher::{Outcome, Pool, PoolConfig, Sender, SenderConfig};
-use relay_domain::{outcome::Class, url_guard::Policy};
+use relay_domain::{
+    outcome::Class,
+    url_guard::{Policy, Ports},
+};
 use relay_store::Store;
 use relay_testkit::Receiver;
 use sqlx::PgPool;
@@ -24,6 +27,23 @@ use uuid::Uuid;
 
 fn strict() -> SenderConfig {
     SenderConfig::default()
+}
+
+/// Strict about *addresses* only.
+///
+/// Most of this file is about the address guard, and the scheme and port rules would
+/// otherwise refuse the test URLs before the interesting check ever ran — which
+/// would make every test below pass for the wrong reason. Their own rules are tested
+/// separately, at the bottom.
+fn strict_addresses() -> SenderConfig {
+    SenderConfig {
+        policy: Policy {
+            allow_private: false,
+            require_https: false,
+            ports: Ports::Any,
+        },
+        ..SenderConfig::default()
+    }
 }
 
 fn pool_config() -> PoolConfig {
@@ -61,12 +81,15 @@ async fn the_cloud_metadata_address_is_refused(pool: PgPool) {
     )
     .await;
 
-    let sender = Pool::with_config(store.clone(), pool_config(), strict());
+    let sender = Pool::with_config(store.clone(), pool_config(), strict_addresses());
     assert_eq!(sender.run_once().await.expect("run"), 1);
 
     let d = store.get_delivery(id).await.unwrap().unwrap();
     assert_eq!(d.status, "dead", "the request must not have been made");
-    assert_eq!(d.dead_reason.as_deref(), Some("permanent_failure"));
+    // Its own reason, not `permanent_failure`. A customer pointing an endpoint at an
+    // internal address is a security signal, and folded in with ordinary `404`s a
+    // spike in it reads as somebody deploying a broken URL.
+    assert_eq!(d.dead_reason.as_deref(), Some("refused"));
 
     let attempt = &store.attempt_history(id).await.unwrap()[0];
     assert_eq!(attempt.outcome_class, "permanent");
@@ -97,7 +120,7 @@ async fn a_real_receiver_on_loopback_is_refused_under_the_strict_policy(pool: Pg
     let addr = receiver.spawn().await;
     let id = queue(&store, &format!("http://{addr}/verify")).await;
 
-    let sender = Pool::with_config(store.clone(), pool_config(), strict());
+    let sender = Pool::with_config(store.clone(), pool_config(), strict_addresses());
     assert_eq!(sender.run_once().await.expect("run"), 1);
 
     assert_eq!(receiver.hits(), 0, "the request reached the receiver");
@@ -133,7 +156,7 @@ async fn loopback_is_refused_however_the_url_spells_it(pool: PgPool) {
         ids.push((url, queue(&store, url).await));
     }
 
-    let sender = Pool::with_config(store.clone(), pool_config(), strict());
+    let sender = Pool::with_config(store.clone(), pool_config(), strict_addresses());
     for _ in 0..10 {
         sender.run_once().await.expect("run");
     }
@@ -155,7 +178,7 @@ async fn a_refusal_is_permanent_and_does_not_burn_the_retry_budget(pool: PgPool)
     let store = Store::from_pool(pool);
     let id = queue(&store, "http://169.254.169.254/latest/meta-data/").await;
 
-    let sender = Sender::with_config(store.clone(), strict());
+    let sender = Sender::with_config(store.clone(), strict_addresses());
     let outcome = sender
         .deliver_by_id(id)
         .await
@@ -182,7 +205,7 @@ async fn non_http_schemes_are_refused(pool: PgPool) {
     let store = Store::from_pool(pool);
     let id = queue(&store, "file:///etc/passwd").await;
 
-    let sender = Pool::with_config(store.clone(), pool_config(), strict());
+    let sender = Pool::with_config(store.clone(), pool_config(), strict_addresses());
     assert_eq!(sender.run_once().await.expect("run"), 1);
 
     let attempt = &store.attempt_history(id).await.unwrap()[0];
@@ -210,7 +233,7 @@ async fn a_public_endpoint_still_works_under_the_strict_policy(pool: PgPool) {
     // a refusal.
     let id = queue(&store, "http://93.184.216.34:9/never-answers").await;
 
-    let sender = Pool::with_config(store.clone(), pool_config(), strict());
+    let sender = Pool::with_config(store.clone(), pool_config(), strict_addresses());
     assert_eq!(sender.run_once().await.expect("run"), 1);
 
     let attempt = &store.attempt_history(id).await.unwrap()[0];
@@ -246,4 +269,163 @@ async fn the_permissive_policy_is_what_makes_loopback_work(pool: PgPool) {
         store.get_delivery(id).await.unwrap().unwrap().status,
         "succeeded"
     );
+}
+
+// -------------------------------------------------------- scheme and port rules
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn plain_http_is_refused_under_the_production_policy(pool: PgPool) {
+    let store = Store::from_pool(pool);
+    // A perfectly ordinary public address. The address guard has no objection; the
+    // transport does.
+    let id = queue(&store, "http://example.com/hook").await;
+
+    let sender = Pool::with_config(store.clone(), pool_config(), strict());
+    assert_eq!(sender.run_once().await.expect("run"), 1);
+
+    let d = store.get_delivery(id).await.unwrap().unwrap();
+    assert_eq!(d.status, "dead");
+    assert_eq!(d.dead_reason.as_deref(), Some("refused"));
+
+    let attempt = &store.attempt_history(id).await.unwrap()[0];
+    // The signature proves who sent the payload and that nobody altered it. It does
+    // nothing to keep it private, so a webhook carrying a customer's order over
+    // plain HTTP is readable by every hop between here and there.
+    assert!(
+        attempt
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("https is required"),
+        "got: {:?}",
+        attempt.error
+    );
+    assert!(
+        attempt.http_status.is_none(),
+        "nothing should have been sent"
+    );
+}
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn a_port_outside_the_allow_list_is_refused(pool: PgPool) {
+    let store = Store::from_pool(pool);
+    // Public address, TLS, and a port no webhook receiver listens on. A public
+    // address plus an arbitrary port is still a port scanner, and an endpoint URL is
+    // a place to receive webhooks.
+    let id = queue(&store, "https://example.com:6379/hook").await;
+
+    let sender = Pool::with_config(store.clone(), pool_config(), strict());
+    assert_eq!(sender.run_once().await.expect("run"), 1);
+
+    let d = store.get_delivery(id).await.unwrap().unwrap();
+    assert_eq!(d.dead_reason.as_deref(), Some("refused"));
+    let attempt = &store.attempt_history(id).await.unwrap()[0];
+    assert!(
+        attempt.error.as_deref().unwrap().contains("port 6379"),
+        "got: {:?}",
+        attempt.error
+    );
+}
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn the_default_port_is_checked_even_though_the_url_omits_it(pool: PgPool) {
+    let store = Store::from_pool(pool);
+    // `http://host/` and `http://host:80/` are the same destination and only one of
+    // them says so. Checking the text rather than the resolved port would let the
+    // first through.
+    let id = queue(&store, "http://example.com/hook").await;
+
+    let sender = Pool::with_config(
+        store.clone(),
+        pool_config(),
+        SenderConfig {
+            policy: Policy {
+                allow_private: false,
+                // TLS not required, so the scheme check passes and the port check is
+                // what has to catch it.
+                require_https: false,
+                ports: Ports::Only(vec![443]),
+            },
+            ..SenderConfig::default()
+        },
+    );
+    assert_eq!(sender.run_once().await.expect("run"), 1);
+
+    let attempt = &store.attempt_history(id).await.unwrap()[0];
+    assert!(
+        attempt.error.as_deref().unwrap().contains("port 80"),
+        "the implied port should be checked, got: {:?}",
+        attempt.error
+    );
+}
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn a_refusal_is_told_apart_from_an_ordinary_permanent_failure(pool: PgPool) {
+    let store = Store::from_pool(pool);
+    let receiver = Receiver::new("whsec_ssrf_test");
+    let addr = receiver.spawn().await;
+
+    // One endpoint that answers `404` — a working server saying no — and one that is
+    // never contacted at all. Both end up dead, and an operator needs to tell them
+    // apart: the first is a customer's broken path, the second is somebody pointing
+    // an endpoint somewhere they should not.
+    //
+    // Delivered one at a time under different policies, because the receiver is on
+    // loopback: under the strict policy it would be refused too, and the test would
+    // pass while proving nothing.
+    let answered = queue(&store, &format!("http://{addr}/nope")).await;
+    let refused = queue(&store, "http://169.254.169.254/latest/meta-data/").await;
+
+    Sender::with_config(
+        store.clone(),
+        SenderConfig {
+            policy: Policy::permissive(),
+            ..SenderConfig::default()
+        },
+    )
+    .deliver_by_id(answered)
+    .await
+    .expect("deliver the one that answers");
+
+    Sender::with_config(store.clone(), strict_addresses())
+        .deliver_by_id(refused)
+        .await
+        .expect("deliver the one that is refused");
+
+    assert_eq!(
+        store
+            .get_delivery(answered)
+            .await
+            .unwrap()
+            .unwrap()
+            .dead_reason
+            .as_deref(),
+        Some("permanent_failure")
+    );
+    assert_eq!(
+        store
+            .get_delivery(refused)
+            .await
+            .unwrap()
+            .unwrap()
+            .dead_reason
+            .as_deref(),
+        Some("refused")
+    );
+
+    // And the dead letter queue can be filtered down to just the security-relevant
+    // ones, which is the whole reason the reason is stored rather than inferred.
+    let only_refused = store
+        .dead_letters(
+            &relay_store::DeadLetterFilter {
+                endpoint_id: None,
+                reason: Some(relay_store::DeadReason::Refused),
+                event_type: None,
+            },
+            10,
+        )
+        .await
+        .expect("dlq");
+    assert_eq!(only_refused.len(), 1);
+    assert_eq!(only_refused[0].delivery_id, refused);
 }
