@@ -86,6 +86,20 @@ const QUEUE_DUE: &str = "relay_queue_due";
 const QUEUE_OLDEST: &str = "relay_queue_oldest_pending_age_seconds";
 /// Endpoints in each breaker state.
 const BREAKERS: &str = "relay_endpoint_breakers";
+/// On-disk size of each of Relay's tables, indexes included.
+///
+/// Per table rather than a total, because a total cannot say *which* one stopped
+/// being pruned — and the answer is almost always the attempt log, which is the only
+/// table that grows with traffic rather than with customers.
+const TABLE_BYTES: &str = "relay_table_bytes";
+/// Daily partitions of the attempt log that currently exist.
+const PARTITIONS: &str = "relay_attempt_partitions";
+/// Rows that landed in the attempt log's default partition.
+///
+/// Should be zero forever. Anything here arrived while its own day had no partition,
+/// and the recovery is manual — so this is the one retention number worth alerting
+/// on rather than graphing.
+const DEFAULT_PARTITION_ROWS: &str = "relay_attempt_default_partition_rows";
 
 // ---------------------------------------------------------------- the exporter
 
@@ -230,6 +244,13 @@ async fn refresh_gauges(store: &Store) -> Result<(), relay_store::StoreError> {
     // a gap rather than a value, which is exactly what it is.
     metrics::gauge!(QUEUE_OLDEST).set(q.oldest_pending_age_secs.unwrap_or(f64::NAN));
 
+    for t in store.table_sizes().await? {
+        metrics::gauge!(TABLE_BYTES, "table" => t.table_name).set(t.bytes as f64);
+    }
+    metrics::gauge!(PARTITIONS).set(store.attempt_partitions().await? as f64);
+    metrics::gauge!(DEFAULT_PARTITION_ROWS)
+        .set(store.attempts_in_default_partition().await? as f64);
+
     let b = store.breaker_stats().await?;
     metrics::gauge!(BREAKERS, "state" => "closed").set(b.closed as f64);
     metrics::gauge!(BREAKERS, "state" => "open").set(b.open as f64);
@@ -282,6 +303,16 @@ fn describe() {
         "How far past due the oldest pending delivery is"
     );
     metrics::describe_gauge!(BREAKERS, "Endpoints in each breaker state");
+    metrics::describe_gauge!(
+        TABLE_BYTES,
+        metrics::Unit::Bytes,
+        "On-disk size of each table, indexes included"
+    );
+    metrics::describe_gauge!(PARTITIONS, "Daily partitions of the attempt log");
+    metrics::describe_gauge!(
+        DEFAULT_PARTITION_ROWS,
+        "Attempts that landed in the default partition; should always be zero"
+    );
 }
 
 /// Report every counter at zero, and every label value it can ever carry.
