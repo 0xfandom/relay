@@ -40,13 +40,54 @@ use uuid::Uuid;
 /// Customer error pages can be enormous. Store enough to debug with, no more.
 const SNIPPET_BYTES: usize = 2048;
 
+/// Every bound on one outbound request.
+///
+/// Three timeouts rather than one, because they fail differently. A missing *total*
+/// timeout is the classic way a worker pool dies: a per-read timeout resets on every
+/// byte, so an endpoint dribbling one byte every fifty milliseconds satisfies it
+/// forever while holding a worker until the process is restarted. The read timeout
+/// catches the opposite case cheaply — a connection that goes silent mid-response is
+/// abandoned in seconds rather than waiting out the whole budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestLimits {
+    /// Time to establish a connection.
+    pub connect: Duration,
+    /// Longest gap between two reads before the response is abandoned.
+    pub read: Duration,
+    /// Ceiling on the whole request, connect included. The only one that bounds a
+    /// slow trickle.
+    pub total: Duration,
+    /// Largest payload Relay will send.
+    ///
+    /// The ingest API already refuses anything bigger, so this normally cannot
+    /// trigger. It exists for the case that is not normal: a cap lowered after rows
+    /// were already stored under the old one.
+    pub max_payload_bytes: usize,
+    /// How much of a response body is read before the rest is discarded.
+    pub max_response_bytes: usize,
+}
+
+impl Default for RequestLimits {
+    fn default() -> Self {
+        Self {
+            connect: CONNECT_TIMEOUT,
+            read: READ_TIMEOUT,
+            total: REQUEST_TIMEOUT,
+            max_payload_bytes: MAX_PAYLOAD_BYTES,
+            max_response_bytes: SNIPPET_BYTES,
+        }
+    }
+}
+
 /// How long the winner of a probe has to report back before another may be issued.
 ///
 /// Longer than one request, so a probe that is merely slow is not raced by a second.
 /// Finite, because a probe against an endpoint that accepts connections and never
 /// answers would otherwise leave the breaker half-open forever with nobody allowed to
 /// try again — a permanent outage produced by the thing meant to end one.
-const PROBE_DEADLINE: Duration = Duration::from_secs(REQUEST_TIMEOUT.as_secs() * 2);
+fn probe_deadline(total: Duration) -> Duration {
+    total * 2
+}
 
 /// Longest a delivery waits after finding its endpoint at its concurrency cap.
 /// Jittered down from here, so a saturated endpoint's backlog does not return in a
@@ -62,6 +103,16 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Time to establish a connection, inside [`REQUEST_TIMEOUT`].
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Longest silence between two reads of a response body.
+///
+/// Shorter than the total, and doing a different job: a connection that simply stops
+/// talking is abandoned here in seconds instead of occupying a worker for the whole
+/// budget. It cannot replace the total timeout — it resets on every byte received.
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Largest payload Relay will send, matching the ingest cap.
+pub const MAX_PAYLOAD_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SendError {
@@ -177,6 +228,12 @@ pub struct Sender {
     /// together are the only place the breaker's behaviour is visible from outside.
     probes: Arc<AtomicU64>,
     probes_recovered: Arc<AtomicU64>,
+    /// Bytes of response body actually pulled off the wire, across every delivery.
+    ///
+    /// Counted so the cap is provable rather than asserted. An endpoint returning an
+    /// eight-megabyte error page must not cost eight megabytes of reads, and the
+    /// only way to show that is to count what was read.
+    response_bytes_read: Arc<AtomicU64>,
 }
 
 /// How one delivery attempt behaves.
@@ -193,6 +250,8 @@ pub struct SenderConfig {
     pub rate_limit: bool,
     /// How many requests may be in flight, in total and per endpoint.
     pub limits: Limits,
+    /// The bounds on any one request: three timeouts and two size caps.
+    pub request: RequestLimits,
     /// When to stop delivering to an endpoint entirely, and how long for.
     ///
     /// `None` disables the breaker. Off only for tests that are exercising something
@@ -208,6 +267,7 @@ impl Default for SenderConfig {
             policy: Policy::default(),
             rate_limit: true,
             limits: Limits::default(),
+            request: RequestLimits::default(),
             breaker: Some(breaker::Policy::default()),
         }
     }
@@ -230,11 +290,16 @@ impl Sender {
 
     pub fn with_config(store: Store, config: SenderConfig) -> Self {
         let client = reqwest::Client::builder()
-            // Three separate limits. A missing *total* timeout is the classic way a
-            // worker pool dies: a per-read timeout resets on every byte, so a slow
-            // trickle can hold a connection open indefinitely.
-            .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(REQUEST_TIMEOUT)
+            // Three separate limits, doing three different jobs — see
+            // [`RequestLimits`]. The total is the one that matters most: a per-read
+            // timeout resets on every byte, so without it an endpoint dribbling one
+            // byte at a time holds a worker until the process is restarted.
+            .connect_timeout(config.request.connect)
+            // Resets on every byte received, so it catches a connection that has
+            // gone silent and nothing else.
+            .read_timeout(config.request.read)
+            // The only bound on a response that keeps arriving slowly forever.
+            .timeout(config.request.total)
             // Not following redirects is a security control as much as a simplicity
             // one: a `302` is the easiest way for a URL that passed validation to end
             // up pointing at an internal address.
@@ -252,6 +317,7 @@ impl Sender {
             bulkhead: Arc::new(Bulkhead::new(config.limits)),
             probes: Arc::new(AtomicU64::new(0)),
             probes_recovered: Arc::new(AtomicU64::new(0)),
+            response_bytes_read: Arc::new(AtomicU64::new(0)),
             config,
         }
     }
@@ -265,6 +331,14 @@ impl Sender {
     /// how much work is being spent on endpoints that are not coming back.
     pub fn probes_recovered(&self) -> u64 {
         self.probes_recovered.load(Ordering::Relaxed)
+    }
+
+    /// Response-body bytes read from the network since start.
+    ///
+    /// Should stay close to `deliveries x max_response_bytes` no matter how large
+    /// the bodies actually are.
+    pub fn response_bytes_read(&self) -> u64 {
+        self.response_bytes_read.load(Ordering::Relaxed)
     }
 
     /// The in-flight caps this sender is enforcing.
@@ -479,6 +553,44 @@ impl Sender {
         Ok(Outcome::Deferred { after })
     }
 
+    /// Record a delivery that was never sent because it is too large.
+    ///
+    /// Permanent rather than retryable: the payload is stored and will not shrink,
+    /// so every retry would fail identically while the endpoint waits for something
+    /// that is never coming.
+    async fn oversized(&self, p: PendingDelivery, cap: usize) -> Result<Outcome, SendError> {
+        let error = format!(
+            "payload is {} bytes, over the {cap}-byte limit",
+            p.raw_payload.len()
+        );
+        tracing::warn!(delivery_id = %p.delivery_id, bytes = p.raw_payload.len(), cap,
+            "refusing to send an oversized payload");
+
+        self.store
+            .finish_attempt(
+                p.delivery_id,
+                p.attempt,
+                AttemptResult::Dead {
+                    reason: DeadReason::PermanentFailure,
+                },
+                None,
+                0,
+                Disposition::Permanent.as_str(),
+                Some(&error),
+                None,
+                &self.worker_id,
+            )
+            .await?;
+
+        relay_metrics::attempt(Disposition::Permanent.as_str());
+        relay_metrics::dead(DeadReason::PermanentFailure.as_str());
+        Ok(Outcome::Failed {
+            class: Class::Permanent,
+            status: None,
+            error,
+        })
+    }
+
     /// Record a delivery that was never sent because its destination was refused.
     async fn refuse(&self, p: PendingDelivery, refused: Refused) -> Result<Outcome, SendError> {
         let error = refused.to_string();
@@ -621,7 +733,7 @@ impl Sender {
                 // deadline like any other blocked delivery.
                 if self
                     .store
-                    .claim_probe(p.endpoint_id, PROBE_DEADLINE)
+                    .claim_probe(p.endpoint_id, probe_deadline(self.config.request.total))
                     .await?
                 {
                     self.probes.fetch_add(1, Ordering::Relaxed);
@@ -677,6 +789,16 @@ impl Sender {
             Gated::BreakerOpen { until } => return self.defer_open_breaker(p, until).await,
             Gated::ProbeInFlight => return self.defer_probe_in_flight(p).await,
         };
+
+        // Refused before a connection is opened, for the same reason a bad address
+        // is: the request is not one Relay is willing to make. Normally unreachable,
+        // because ingest already refuses anything larger — it exists for the case
+        // where that cap was lowered after these rows were stored.
+        if p.raw_payload.len() > self.config.request.max_payload_bytes {
+            return self
+                .oversized(p, self.config.request.max_payload_bytes)
+                .await;
+        }
 
         // A refused destination is permanent — no amount of retrying makes an
         // internal address public — and nothing about the refusal is written back to
@@ -737,7 +859,10 @@ impl Sender {
                     .get(reqwest::header::RETRY_AFTER)
                     .and_then(|v| v.to_str().ok())
                     .and_then(relay_domain::backoff::parse_retry_after);
-                let snippet = read_snippet(resp).await;
+                let (snippet, read) =
+                    read_snippet(resp, self.config.request.max_response_bytes).await;
+                self.response_bytes_read
+                    .fetch_add(read as u64, Ordering::Relaxed);
                 if class == Class::Success {
                     (
                         Outcome::Succeeded { status },
@@ -1404,11 +1529,12 @@ impl Default for ReaperConfig {
 
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "lease TTL {lease_ttl:?} must be longer than the request timeout {REQUEST_TIMEOUT:?}: \
+    "lease TTL {lease_ttl:?} must be longer than the request timeout {request_timeout:?}: \
      a lease that expires mid-request lets a second worker send the same delivery"
 )]
 pub struct LeaseTooShort {
     pub lease_ttl: Duration,
+    pub request_timeout: Duration,
 }
 
 /// Returns deliveries stranded by dead workers to the queue.
@@ -1427,9 +1553,24 @@ impl Reaper {
     /// Fails if the lease could expire while a request is still in flight, which
     /// would turn the reaper from a safety net into a source of duplicates.
     pub fn new(store: Store, config: ReaperConfig) -> Result<Self, LeaseTooShort> {
-        if config.lease_ttl <= REQUEST_TIMEOUT {
+        Self::with_request_timeout(store, config, REQUEST_TIMEOUT)
+    }
+
+    /// As [`Reaper::new`], checked against a sender whose total timeout is not the
+    /// default.
+    ///
+    /// The check is the whole reason this parameter exists: the lease and the request
+    /// timeout are configured independently, and a deployment that raises one without
+    /// the other gets duplicate deliveries with nothing reporting why.
+    pub fn with_request_timeout(
+        store: Store,
+        config: ReaperConfig,
+        request_timeout: Duration,
+    ) -> Result<Self, LeaseTooShort> {
+        if config.lease_ttl <= request_timeout {
             return Err(LeaseTooShort {
                 lease_ttl: config.lease_ttl,
+                request_timeout,
             });
         }
         Ok(Self {
@@ -1579,9 +1720,9 @@ fn unix_now() -> i64 {
 /// before anything trimmed it — with a pool of workers, a handful of endpoints
 /// returning multi-megabyte HTML is enough to matter. Stopping at the cap means the
 /// size of their error page is their problem, not ours.
-async fn read_snippet(mut resp: reqwest::Response) -> String {
+async fn read_snippet(mut resp: reqwest::Response, cap: usize) -> (String, usize) {
     let mut buf: Vec<u8> = Vec::new();
-    while buf.len() < SNIPPET_BYTES {
+    while buf.len() < cap {
         match resp.chunk().await {
             Ok(Some(chunk)) => buf.extend_from_slice(&chunk),
             // A body that fails midway is not worth failing the attempt over: the
@@ -1589,7 +1730,12 @@ async fn read_snippet(mut resp: reqwest::Response) -> String {
             Ok(None) | Err(_) => break,
         }
     }
-    truncate(&String::from_utf8_lossy(&buf), SNIPPET_BYTES)
+    let read = buf.len();
+    // Dropping the response here closes the connection without draining it, so the
+    // remaining bytes are never pulled across. Reading to the end and then
+    // truncating would produce the same string and cost the whole eight megabytes.
+    drop(resp);
+    (truncate(&String::from_utf8_lossy(&buf), cap), read)
 }
 
 /// Truncate on a character boundary so the result is always valid UTF-8.

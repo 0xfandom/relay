@@ -1,7 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use relay_dispatcher::{
-    Limits, Pool, PoolConfig, Pruner, PrunerConfig, REQUEST_TIMEOUT, Reaper, ReaperConfig,
+    Limits, Pool, PoolConfig, Pruner, PrunerConfig, Reaper, ReaperConfig, RequestLimits,
     SenderConfig,
 };
 use relay_domain::url_guard::Policy;
@@ -88,11 +88,27 @@ async fn main() -> anyhow::Result<()> {
         })
     };
 
+    // Every bound on a single outbound request. The total timeout is the one that
+    // has to exist: a per-read timeout resets on every byte, so without it an
+    // endpoint dribbling one byte at a time holds a worker until this process is
+    // restarted.
+    let request = RequestLimits {
+        connect: Duration::from_secs(env_usize("RELAY_CONNECT_TIMEOUT_SECS", 5)? as u64),
+        read: Duration::from_secs(env_usize("RELAY_READ_TIMEOUT_SECS", 5)? as u64),
+        total: Duration::from_secs(env_usize("RELAY_REQUEST_TIMEOUT_SECS", 10)? as u64),
+        max_payload_bytes: env_usize(
+            "RELAY_MAX_PAYLOAD_BYTES",
+            relay_dispatcher::MAX_PAYLOAD_BYTES,
+        )?,
+        max_response_bytes: env_usize("RELAY_MAX_RESPONSE_BYTES", 2048)?,
+    };
+
     let sender_config = SenderConfig {
         backoff: Default::default(),
         policy: policy.clone(),
         rate_limit,
         limits,
+        request,
         breaker,
     };
 
@@ -119,7 +135,11 @@ async fn main() -> anyhow::Result<()> {
 
     // Rejected at startup rather than tolerated, because a lease shorter than the
     // request timeout produces duplicate deliveries and nothing else would report it.
-    let reaper = Arc::new(Reaper::new(store.clone(), reaper_config.clone())?);
+    let reaper = Arc::new(Reaper::with_request_timeout(
+        store.clone(),
+        reaper_config.clone(),
+        request.total,
+    )?);
     let pruner = Arc::new(Pruner::new(store.clone(), pruner_config.clone()));
 
     tracing::info!(
@@ -128,7 +148,7 @@ async fn main() -> anyhow::Result<()> {
         db_connections,
         lease_ttl = ?reaper_config.lease_ttl,
         idempotency_retention = ?pruner_config.retention,
-        request_timeout = ?REQUEST_TIMEOUT,
+        request = ?request,
         shutdown_deadline = ?config.shutdown_deadline,
         policy = ?policy,
         rate_limit,
