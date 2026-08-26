@@ -339,16 +339,39 @@ from inside the instance, where the cloud metadata service answers without
 authentication, and the stored response snippet would carry the credentials back out
 through the delivery history.
 
-So the dispatcher refuses any URL that is not `http`/`https`, and any host that
-resolves into loopback, private, link-local, carrier-NAT, multicast or reserved
-space — checked against the resolved address rather than the URL text, because
-loopback has too many spellings to blocklist. The check happens at send time, not
-only at registration, since a domain that is public today can be repointed
-tomorrow. Redirects are not followed, and a refused delivery stores no response
-body.
+So a delivery has to clear four things before a connection is opened:
 
-`RELAY_ALLOW_PRIVATE_ENDPOINTS=true` disables the address check for local
-development. It is off by default and should stay off anywhere real.
+| Check | Default | Why |
+| --- | --- | --- |
+| Scheme | `https` only | The signature proves who sent a payload and that nobody changed it. It does nothing to keep it private. |
+| Port | `443` | A public address on an arbitrary port is still a port scanner. An endpoint URL is a place to receive webhooks. |
+| Address | Public ranges only | Loopback, private, link-local, carrier-NAT, multicast and reserved space are all refused. |
+| Redirects | Not followed | A `302` is the easiest way for a URL that passed validation to end up somewhere else. |
+
+The address is checked against what the hostname *resolves to*, never against the
+URL text — loopback has far too many spellings (`127.1`, `0.0.0.0`, `2130706433`,
+`0x7f000001`, `::ffff:127.0.0.1`) for a string blocklist to catch them all. And the
+check lives inside the HTTP client's own DNS resolver, so the address that was
+approved is the address connected to; checking first and connecting second lets a
+resolver under the attacker's control answer honestly once and dishonestly once.
+
+A refused delivery is recorded with its own dead-letter reason, `refused`, kept
+apart from `permanent_failure`. The two need different responses from a person: a
+permanent failure is a customer's broken URL, a refusal is somebody pointing an
+endpoint at an address they should not — which is worth an alert before they try the
+next spelling.
+
+`RELAY_ALLOW_PRIVATE_ENDPOINTS=true` is the development switch, and the other two
+rules follow it unless set explicitly: a laptop's receivers are on loopback, over
+plain HTTP, on whatever port the OS handed out. Needing three variables to say "this
+is a laptop" means somebody eventually sets the first one in production to make an
+error go away. `RELAY_REQUIRE_HTTPS` and `RELAY_ALLOWED_PORTS` (a comma-separated
+list, or `*`) override it either way.
+
+Both processes build this policy from the same variables. Registration is only a
+courtesy check — the authority is the send path — but a courtesy check that
+disagrees with the authority is worse than none, because it accepts URLs that will
+never deliver and the caller finds out from the dead letter queue.
 
 ## What Relay reports about itself
 
