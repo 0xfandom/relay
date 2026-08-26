@@ -23,7 +23,7 @@ use std::{
 
 use axum::{
     Router,
-    body::Bytes,
+    body::{Body, Bytes},
     extract::{Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -132,6 +132,7 @@ impl Receiver {
             .route("/flaky", post(flaky))
             .route("/429", post(too_many))
             .route("/bigbody", post(big_body))
+            .route("/trickle", post(trickle))
             .route("/toggle", post(toggle))
             .route("/received", get(received))
             .with_state(self.clone())
@@ -235,6 +236,39 @@ async fn slow(
     let _in_flight = record(&state, &headers, &body);
     tokio::time::sleep(Duration::from_millis(p.ms)).await;
     (StatusCode::OK, "slow ok").into_response()
+}
+
+/// A response that never stops arriving, one byte at a time.
+///
+/// The failure mode a per-read timeout cannot catch: every individual read succeeds
+/// well inside the deadline, so the timeout resets forever and one endpoint holds a
+/// worker until the process dies. Only a *total* timeout ends this, which is why
+/// this route exists to be pointed at.
+async fn trickle(
+    State(state): State<Receiver>,
+    Query(p): Query<TrickleParams>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let _in_flight = record(&state, &headers, &body);
+    let interval = Duration::from_millis(p.ms);
+    let stream = async_stream::stream! {
+        loop {
+            tokio::time::sleep(interval).await;
+            yield Ok::<_, std::io::Error>(Bytes::from_static(b"x"));
+        }
+    };
+    (StatusCode::OK, Body::from_stream(stream)).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct TrickleParams {
+    /// Gap between bytes. Comfortably inside any sane read timeout.
+    #[serde(default = "default_trickle_ms")]
+    pub ms: u64,
+}
+fn default_trickle_ms() -> u64 {
+    50
 }
 
 #[derive(Deserialize)]
