@@ -484,6 +484,43 @@ filtered in the handler, so a route added later cannot forget to apply it. The
 endpoint is Relay's ownership boundary today; when tenants exist, the tenant
 predicate joins it there.
 
+## What one endpoint can make Relay spend
+
+Every bound on a single outbound request, all configurable, all with defaults that
+are safe rather than generous:
+
+| Limit | Default | Env |
+| --- | --- | --- |
+| Connect timeout | 5s | `RELAY_CONNECT_TIMEOUT_SECS` |
+| Read timeout | 5s | `RELAY_READ_TIMEOUT_SECS` |
+| Total timeout | 10s | `RELAY_REQUEST_TIMEOUT_SECS` |
+| Payload sent | 256 KiB | `RELAY_MAX_PAYLOAD_BYTES` |
+| Response body read | 2 KiB | `RELAY_MAX_RESPONSE_BYTES` |
+
+Three timeouts rather than one, because they fail differently. The read timeout
+catches a connection that goes silent — abandoned in seconds instead of occupying a
+worker for the whole budget. It cannot replace the total timeout, because **it
+resets on every byte**: an endpoint answering `200` and then dribbling its body one
+byte every fifty milliseconds satisfies a read timeout indefinitely. That is the
+classic way a worker pool dies, and only the total timeout ends it. There is a
+`/trickle` route in the testkit and a test that points Relay at it.
+
+The response body is streamed and stopped at the cap, then the connection is
+dropped without draining it. Reading to the end and truncating afterwards produces
+the identical stored snippet and costs the whole eight-megabyte error page, so the
+test asserts the *bytes actually read from the network*, not the length of what was
+stored.
+
+The lease TTL is validated against the configured total timeout at startup, not
+against a constant. The two are set independently, and a lease that can expire
+mid-request hands the row to a second worker — the endpoint gets the webhook twice
+and nothing reports why.
+
+`RELAY_MAX_PAYLOAD_BYTES` bounds both ends: ingest refuses a larger body with a
+`413`, and the dispatcher refuses to send one. The second is unreachable in normal
+operation and exists for the case that is not normal — a cap lowered after rows were
+already stored under the old one, which would otherwise retry forever.
+
 ## Reading the logs
 
 Both binaries emit JSON when their stderr is a pipe and human-readable text when it
