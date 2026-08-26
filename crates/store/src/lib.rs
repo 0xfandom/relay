@@ -1121,6 +1121,114 @@ impl Store {
         Ok(found.is_some())
     }
 
+    /// Create the daily attempt partitions for the next `days_ahead` days.
+    ///
+    /// Idempotent, and normally creates nothing. The point is the margin: the window
+    /// between "this partition is needed" and "this partition exists" is the entire
+    /// risk, and creating them weeks ahead means this job can be broken for a
+    /// fortnight without a single row falling into the default partition.
+    pub async fn ensure_attempt_partitions(&self, days_ahead: i32) -> Result<i64> {
+        let made: i32 = sqlx::query_scalar("SELECT relay_ensure_attempt_partitions($1)")
+            .bind(days_ahead)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(made as i64)
+    }
+
+    /// Drop every attempt partition entirely older than the window.
+    ///
+    /// A `DROP TABLE` per partition rather than a `DELETE` over rows: unlinking files
+    /// is O(1) and writes almost nothing, where deleting ten million rows marks every
+    /// one of them dead, writes a WAL record each, and leaves autovacuum to reclaim
+    /// space on the busiest table in the system.
+    pub async fn drop_attempt_partitions(&self, retention_days: i32) -> Result<Vec<String>> {
+        let dropped: Vec<String> = sqlx::query_scalar("SELECT relay_drop_attempt_partitions($1)")
+            .bind(retention_days)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(dropped)
+    }
+
+    /// Rows that landed in the default partition.
+    ///
+    /// Should always be zero. Anything here arrived while its own day's partition did
+    /// not exist, and the recovery is manual — a new partition cannot be created over
+    /// a range the default already holds rows for.
+    pub async fn attempts_in_default_partition(&self) -> Result<i64> {
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM delivery_attempts_default")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(n)
+    }
+
+    /// How many daily partitions exist.
+    pub async fn attempt_partitions(&self) -> Result<i64> {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*)
+             FROM pg_class c
+             JOIN pg_inherits i ON i.inhrelid = c.oid
+             JOIN pg_class p ON p.oid = i.inhparent
+             WHERE p.relname = 'delivery_attempts'
+               AND c.relname ~ '^delivery_attempts_[0-9]{8}$'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(n)
+    }
+
+    /// Delete terminal deliveries older than the window, in one bounded batch.
+    ///
+    /// Bounded on purpose. An unbounded delete of a month of history takes a lock and
+    /// a transaction long enough to matter, on the table the claim query reads. A
+    /// batch that runs every few minutes and deletes at most `limit` rows never
+    /// blocks a delivery, and the caller loops until it returns zero.
+    ///
+    /// Only terminal rows: a `pending` or `inflight` delivery is still owed to
+    /// somebody, however old it is.
+    pub async fn delete_deliveries(
+        &self,
+        status: DeliveryStatus,
+        older_than: Duration,
+        limit: i64,
+    ) -> Result<u64> {
+        let n = sqlx::query(
+            "DELETE FROM deliveries
+             WHERE id IN (
+                 SELECT id FROM deliveries
+                 WHERE status = $1
+                   AND created_at < now() - make_interval(secs => $2)
+                 LIMIT $3
+             )",
+        )
+        .bind(status.as_str())
+        .bind(older_than.as_secs_f64())
+        .bind(limit)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(n)
+    }
+
+    /// How much disk each of Relay's tables occupies, indexes included.
+    ///
+    /// The number the retention work exists to hold flat. Reported per table because
+    /// a total cannot say *which* one stopped being pruned.
+    pub async fn table_sizes(&self) -> Result<Vec<TableSize>> {
+        let rows = sqlx::query_as::<_, TableSize>(
+            "SELECT c.relname::text AS table_name,
+                    pg_total_relation_size(c.oid)::bigint AS bytes
+             FROM pg_class c
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = 'public'
+               AND c.relkind IN ('r', 'p')
+               AND c.relname IN ('deliveries', 'events', 'endpoints',
+                                 'delivery_attempts', 'idempotency_keys')",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     /// A snapshot of the queue, for the metrics endpoint.
     ///
     /// One statement rather than four round trips, and — more importantly — one
@@ -1174,6 +1282,15 @@ impl Store {
         .await?;
         Ok(row)
     }
+}
+
+/// One table's on-disk footprint.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct TableSize {
+    pub table_name: String,
+    /// Includes indexes and TOAST, because those are disk too — a table whose data
+    /// is small and whose indexes are enormous is still a full disk.
+    pub bytes: i64,
 }
 
 /// Whether an endpoint is mid-rotation, and until when.
