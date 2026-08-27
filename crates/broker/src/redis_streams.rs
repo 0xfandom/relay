@@ -86,6 +86,18 @@ fn transport(e: redis::RedisError) -> Error {
     Error::Transport(e.to_string())
 }
 
+/// Whether Redis is telling us the consumer group is gone.
+///
+/// It goes when the stream goes: deleting the key deletes the group with it, and
+/// every subsequent read fails rather than returning an empty list. A consumer that
+/// treated this as an ordinary transport error would retry forever against a group
+/// that will never come back on its own — the whole fleet silently stops delivering
+/// while Postgres looks perfectly healthy, which is the worst shape a failure can
+/// take here.
+fn is_missing_group(e: &redis::RedisError) -> bool {
+    e.code() == Some("NOGROUP")
+}
+
 #[async_trait]
 impl Broker for RedisStreams {
     async fn ensure(&self) -> Result<(), Error> {
@@ -140,10 +152,28 @@ impl Broker for RedisStreams {
         // from `0` instead would return this consumer's own unacknowledged backlog,
         // which is what `reclaim` is for and would otherwise be re-sent here on every
         // single call.
-        let reply: Option<StreamReadReply> = conn
+        let read: Result<Option<StreamReadReply>, _> = conn
             .xread_options(&[&self.config.stream], &[">"], &opts)
-            .await
-            .map_err(transport)?;
+            .await;
+
+        let reply = match read {
+            Ok(reply) => reply,
+            Err(e) if is_missing_group(&e) => {
+                // Recreate it and return empty rather than retrying the read here.
+                // Anything the group would have carried went with it, and the
+                // reconciliation sweep is what brings those deliveries back — it
+                // reads Postgres, which still has all of them. Retrying the read
+                // would find nothing and only delay noticing.
+                tracing::warn!(
+                    stream = %self.config.stream,
+                    group = %self.config.group,
+                    "consumer group had gone; recreating it"
+                );
+                self.ensure().await?;
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(transport(e)),
+        };
 
         let Some(reply) = reply else {
             // Nil, which is how Redis says the block expired with nothing to give.
@@ -172,7 +202,7 @@ impl Broker for RedisStreams {
         max: usize,
     ) -> Result<Vec<Received>, Error> {
         let mut conn = self.conn();
-        let reply: StreamAutoClaimReply = conn
+        let claimed: Result<StreamAutoClaimReply, _> = conn
             .xautoclaim_options(
                 &self.config.stream,
                 &self.config.group,
@@ -185,13 +215,29 @@ impl Broker for RedisStreams {
                 "0-0",
                 StreamAutoClaimOptions::default().count(max),
             )
-            .await
-            .map_err(transport)?;
+            .await;
+
+        let reply = match claimed {
+            Ok(reply) => reply,
+            // Same as a read: the pending list went with the group, and Postgres is
+            // where those deliveries are recovered from.
+            Err(e) if is_missing_group(&e) => {
+                self.ensure().await?;
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(transport(e)),
+        };
         self.interpret(reply.claimed).await
     }
 
     async fn lag(&self) -> Result<Lag, Error> {
         let mut conn = self.conn();
+        // A missing stream or group is reported as no backlog rather than as an
+        // error. It is a true statement — there is nothing waiting — and a metrics
+        // read should never be the thing that takes a process down.
+        if self.ensure().await.is_err() {
+            return Ok(Lag::default());
+        }
         // `XPENDING` in its summary form: one number, no scan of the pending list.
         let unacked: u64 = redis::cmd("XPENDING")
             .arg(&self.config.stream)
