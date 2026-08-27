@@ -16,7 +16,7 @@ use axum::{
     routing::{get, post},
 };
 use rand::RngExt;
-use relay_domain::{idempotency, rate_limit::Rate, url_guard::Policy};
+use relay_domain::{idempotency, rate_limit::Rate, transport, url_guard::Policy};
 use relay_store::{Cursor, DeadLetterFilter, DeadReason, DeliveryStatus, Store};
 use serde::{Deserialize, Serialize};
 
@@ -47,6 +47,12 @@ pub struct AppState {
     /// the rotation, change a config and roll a fleet is a window that expires
     /// mid-migration, which is the outage the overlap exists to prevent.
     pub secret_overlap: Duration,
+    /// The transports registration will accept, and where their APIs live.
+    ///
+    /// The same registry the dispatcher builds, for the same reason the URL policy is
+    /// shared: an address accepted here and unbuildable at send time is a delivery
+    /// that dies for a reason the caller was never told.
+    pub transports: transport::Registry,
 }
 
 /// Long enough for a customer to notice, change a value and deploy.
@@ -61,6 +67,7 @@ impl AppState {
             policy: Policy::default(),
             max_body_bytes: extract::MAX_BODY_BYTES,
             secret_overlap: DEFAULT_SECRET_OVERLAP,
+            transports: transport::Registry::default(),
         }
     }
 
@@ -71,6 +78,7 @@ impl AppState {
             policy: Policy::permissive(),
             max_body_bytes: extract::MAX_BODY_BYTES,
             secret_overlap: DEFAULT_SECRET_OVERLAP,
+            transports: transport::Registry::default(),
         }
     }
 }
@@ -153,7 +161,18 @@ async fn healthz(State(state): State<AppState>) -> Response {
 
 #[derive(Deserialize)]
 pub struct CreateEndpoint {
+    /// The destination. A URL for `http`; `telegram://<chat_id>` or
+    /// `discord://<webhook_id>` for the chat transports, whose credential goes in
+    /// `secret` rather than into the address.
     pub url: String,
+    /// `http` (the default), `telegram` or `discord`.
+    pub transport: Option<String>,
+    /// The bot or webhook token, for a chat transport.
+    ///
+    /// Absent for `http`, where Relay generates the signing secret itself — there is
+    /// nothing for the caller to supply, and letting them supply one would make a
+    /// weak secret their decision to get wrong.
+    pub secret: Option<String>,
     /// Empty or absent means "every event type".
     #[serde(default)]
     pub event_types: Vec<String>,
@@ -167,8 +186,12 @@ pub struct CreateEndpoint {
 pub struct CreatedEndpoint {
     pub id: uuid::Uuid,
     pub url: String,
+    pub transport: String,
     /// Returned exactly once, at creation. Relay stores it but never shows it again.
-    pub secret: String,
+    ///
+    /// `None` for a chat transport: the caller supplied the credential, so handing it
+    /// back would echo their own token into a response body for no gain.
+    pub secret: Option<String>,
     /// Echoed back so the caller can see what they got when they configured nothing.
     pub rate_per_second: f64,
     pub burst: f64,
@@ -183,7 +206,57 @@ async fn create_endpoint(
     // tomorrow, and only the address resolved at the moment of connecting is worth
     // trusting. Rejecting an obviously bad URL here saves the caller a round trip
     // and a delivery that was always going to be refused.
-    let parsed = reqwest_url(&req.url)?;
+    let kind = match req.transport.as_deref() {
+        None => transport::Kind::Http,
+        Some(t) => transport::Kind::parse(t).ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "unknown transport {t:?}, expected http, telegram or discord"
+            ))
+        })?,
+    };
+
+    // Every transport checks its own address form. A chat address is not a URL and
+    // would fail the checks below for entirely the wrong reason.
+    state
+        .transports
+        .validate(kind, &req.url)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+
+    let secret = match (kind, req.secret.as_deref()) {
+        // Relay generates the signing key. Letting the caller choose one would make a
+        // weak secret their decision to get wrong.
+        (transport::Kind::Http, _) => generate_secret(),
+        (_, Some(token)) if !token.trim().is_empty() => token.to_string(),
+        (_, _) => {
+            return Err(ApiError::BadRequest(format!(
+                "{} endpoints need a secret: the bot or webhook token",
+                kind.as_str()
+            )));
+        }
+    };
+
+    // The URL that will actually be connected to, which for a chat transport is not
+    // the address that was stored. Checking the stored one would check the wrong
+    // string; building it here means registration and the send path apply the same
+    // policy to the same URL.
+    let destination = state
+        .transports
+        .build(
+            kind,
+            &transport::Context {
+                address: &req.url,
+                credential: &secret,
+                previous_credential: None,
+                event_type: "relay.registration_check",
+                delivery_id: "00000000-0000-0000-0000-000000000000",
+                payload: b"{}",
+                timestamp: 0,
+            },
+        )
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?
+        .url;
+
+    let parsed = reqwest_url(&destination)?;
     let bad = |e: relay_domain::url_guard::Refused| ApiError::BadRequest(e.to_string());
     state.policy.check_scheme(parsed.scheme()).map_err(bad)?;
     // An empty host as well as a missing one. Nothing that can be connected to, and
@@ -202,10 +275,9 @@ async fn create_endpoint(
 
     let rate = requested_rate(&req)?;
 
-    let secret = generate_secret();
     let ep = state
         .store
-        .create_endpoint(&req.url, &secret, &req.event_types)
+        .create_endpoint_with(&req.url, &secret, &req.event_types, kind)
         .await?;
 
     // Applied after creation rather than passed into it, so that the overwhelmingly
@@ -220,7 +292,8 @@ async fn create_endpoint(
         Json(CreatedEndpoint {
             id: ep.id,
             url: ep.url,
-            secret,
+            transport: ep.transport,
+            secret: (kind == transport::Kind::Http).then_some(secret),
             rate_per_second: rate.per_second,
             burst: rate.burst,
         }),

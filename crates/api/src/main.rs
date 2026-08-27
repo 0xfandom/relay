@@ -43,6 +43,7 @@ async fn main() -> anyhow::Result<()> {
         policy,
         max_body_bytes,
         secret_overlap,
+        transports: Default::default(),
     };
 
     // Logged and carried on rather than fatal. An API that refuses to accept events
