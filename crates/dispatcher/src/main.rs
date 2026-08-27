@@ -1,8 +1,8 @@
 use std::{sync::Arc, time::Duration};
 
 use relay_dispatcher::{
-    Limits, Pool, PoolConfig, Pruner, PrunerConfig, Reaper, ReaperConfig, RequestLimits,
-    SenderConfig,
+    Heartbeat, Limits, Pool, PoolConfig, Pruner, PrunerConfig, Reaper, ReaperConfig,
+    RequestLimits, SenderConfig,
 };
 use relay_domain::url_guard::Policy;
 use relay_store::Store;
@@ -151,6 +151,14 @@ async fn main() -> anyhow::Result<()> {
     )?);
     let pruner = Arc::new(Pruner::new(store.clone(), pruner_config.clone()));
 
+    // What lets the API tell "idle" apart from "dead". Without it, a dispatcher that
+    // stopped overnight looks exactly like one with an empty queue.
+    let heartbeat_interval = Duration::from_secs(env_usize(
+        "RELAY_HEARTBEAT_INTERVAL_SECS",
+        Heartbeat::DEFAULT_INTERVAL.as_secs() as usize,
+    )? as u64);
+    let heartbeat = Arc::new(Heartbeat::new(store.clone(), heartbeat_interval));
+
     tracing::info!(
         workers = config.workers,
         batch_size = config.batch_size,
@@ -164,6 +172,7 @@ async fn main() -> anyhow::Result<()> {
         max_in_flight = limits.max_in_flight,
         max_per_endpoint = limits.per_endpoint,
         breaker = ?breaker,
+        ?heartbeat_interval,
         %metrics_bind,
         "relay-dispatcher started"
     );
@@ -202,6 +211,11 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move { pruner.run(cancel).await })
     };
 
+    let heartbeat_loop = {
+        let cancel = cancel.clone();
+        tokio::spawn(async move { heartbeat.run(cancel).await })
+    };
+
     // Returns once cancelled and everything in flight has finished or hit the
     // deadline.
     Pool::with_config(store, config, sender_config)
@@ -209,6 +223,9 @@ async fn main() -> anyhow::Result<()> {
         .await;
     let _ = reaper_loop.await;
     let _ = pruner_loop.await;
+    // Stops beating as the process winds down, so the API reports unready within the
+    // staleness window rather than advertising a dispatcher that has gone.
+    let _ = heartbeat_loop.await;
     if let Some(metrics_loop) = metrics_loop {
         let _ = metrics_loop.await;
     }
