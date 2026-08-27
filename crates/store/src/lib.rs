@@ -108,6 +108,38 @@ macro_rules! delivery_page_sql {
 /// is a seek rather than a scan.
 pub const EXPLAIN_DELIVERY_PAGE_SQL: &str = concat!("EXPLAIN ", delivery_page_sql!());
 
+/// Everything a sender needs, assembled from the rows a claim just took.
+///
+/// A macro so the batch claim and the single-row claim are the same projection
+/// rather than two that happen to agree today. They feed one `PendingDelivery`, and
+/// a column added to one and forgotten in the other is a runtime decode failure on
+/// whichever path is less travelled — which, in broker mode, is the one carrying the
+/// traffic.
+macro_rules! claim_projection_sql {
+    () => {
+        "SELECT c.id          AS delivery_id,
+                c.attempt     AS attempt,
+                e.event_type  AS event_type,
+                e.raw_payload AS raw_payload,
+                ep.id         AS endpoint_id,
+                ep.url        AS url,
+                ep.secret     AS secret,
+                -- NULL once the window has closed, decided here rather than by a
+                -- sweeper: an old secret that keeps being sent because a cleanup job
+                -- died is a rotation that never finished.
+                CASE WHEN ep.previous_secret_expires_at > now()
+                     THEN ep.previous_secret END AS previous_secret,
+                ep.rate_per_second AS rate_per_second,
+                ep.burst      AS burst,
+                ep.breaker_state AS breaker_state,
+                ep.breaker_probe_at AS breaker_probe_at,
+                ep.transport  AS transport
+         FROM claimed c
+         JOIN events    e  ON e.id  = c.event_id
+         JOIN endpoints ep ON ep.id = c.endpoint_id"
+    };
+}
+
 const CLAIM_BATCH_SQL: &str = concat!(
     "WITH claimed AS (
          UPDATE deliveries
@@ -116,27 +148,27 @@ const CLAIM_BATCH_SQL: &str = concat!(
     claim_candidates_sql!(),
     ")
          RETURNING id, attempt, event_id, endpoint_id
-     )
-     SELECT c.id          AS delivery_id,
-            c.attempt     AS attempt,
-            e.event_type  AS event_type,
-            e.raw_payload AS raw_payload,
-            ep.id         AS endpoint_id,
-            ep.url        AS url,
-            ep.secret     AS secret,
-            -- NULL once the window has closed, decided here rather than by a
-            -- sweeper: an old secret that keeps being sent because a cleanup job
-            -- died is a rotation that never finished.
-            CASE WHEN ep.previous_secret_expires_at > now()
-                 THEN ep.previous_secret END AS previous_secret,
-            ep.rate_per_second AS rate_per_second,
-            ep.burst      AS burst,
-            ep.breaker_state AS breaker_state,
-            ep.breaker_probe_at AS breaker_probe_at,
-            ep.transport  AS transport
-     FROM claimed c
-     JOIN events    e  ON e.id  = c.event_id
-     JOIN endpoints ep ON ep.id = c.endpoint_id"
+     ) ",
+    claim_projection_sql!()
+);
+
+/// Claim one named delivery, if it is still there to be claimed.
+///
+/// `$1` is the id, `$2` the worker.
+///
+/// The predicate is the batch claim's, minus the search. `status = 'pending'` is what
+/// makes a redelivered message harmless — the second claim simply matches nothing —
+/// and `next_attempt_at <= now()` is what stops a message that has been sitting in
+/// the broker from sending a delivery that has since been rescheduled into the
+/// future. Dropping either one turns at-least-once delivery into a bug.
+const CLAIM_ONE_SQL: &str = concat!(
+    "WITH claimed AS (
+         UPDATE deliveries
+         SET status = 'inflight', locked_at = now(), locked_by = $2
+         WHERE id = $1 AND status = 'pending' AND next_attempt_at <= now()
+         RETURNING id, attempt, event_id, endpoint_id
+     ) ",
+    claim_projection_sql!()
 );
 
 #[derive(Clone)]
@@ -271,6 +303,29 @@ impl Store {
             .fetch_all(&self.pool)
             .await?;
         Ok(rows)
+    }
+
+    /// Take one named delivery, if it is still claimable.
+    ///
+    /// The broker's counterpart to [`Store::claim_batch`]: the message says which
+    /// delivery, this decides whether this worker gets it. `None` is the ordinary
+    /// answer to a redelivered message and is not an error — somebody else already
+    /// has the row, or it is no longer due.
+    ///
+    /// This is the single thing that makes an at-least-once broker safe. Redis
+    /// redelivers, and reclaim deliberately hands the same message to a second
+    /// consumer; without this both would send.
+    pub async fn claim_one(
+        &self,
+        delivery_id: Uuid,
+        worker: &str,
+    ) -> Result<Option<PendingDelivery>> {
+        let row = sqlx::query_as::<_, PendingDelivery>(CLAIM_ONE_SQL)
+            .bind(delivery_id)
+            .bind(worker)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row)
     }
 
     /// Return a claimed delivery to the queue without consuming an attempt.
