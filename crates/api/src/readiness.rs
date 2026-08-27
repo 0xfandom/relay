@@ -111,10 +111,16 @@ pub enum Facts {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Check {
-    Pass { detail: String },
-    Fail { detail: String },
+    Pass {
+        detail: String,
+    },
+    Fail {
+        detail: String,
+    },
     /// Not run, because something it depends on already failed.
-    Skipped { detail: String },
+    Skipped {
+        detail: String,
+    },
 }
 
 impl Check {
@@ -270,7 +276,10 @@ mod tests {
 
     #[test]
     fn a_down_database_skips_the_checks_it_would_have_made_up() {
-        let r = evaluate(&Facts::DatabaseDown("connection refused".into()), Thresholds::default());
+        let r = evaluate(
+            &Facts::DatabaseDown("connection refused".into()),
+            Thresholds::default(),
+        );
         assert!(!r.ready);
         assert!(r.database.failed());
         assert!(matches!(r.dispatcher, Check::Skipped { .. }));
