@@ -17,7 +17,7 @@ thiserror = "2.0.19"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
 tokio-util = "0.7.19"
 tracing = "0.1.44"
-uuid = "1.24.0"
+uuid = { version = "1.24.0", features = ["v4"] }
 
 [dev-dependencies]
 async-trait = "0.1.92"

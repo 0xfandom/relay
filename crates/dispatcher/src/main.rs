@@ -1,8 +1,9 @@
 use std::{sync::Arc, time::Duration};
 
 use relay_dispatcher::{
-    Heartbeat, Limits, Pool, PoolConfig, Pruner, PrunerConfig, Reaper, ReaperConfig, RequestLimits,
-    SenderConfig,
+    BrokerSource, ConsumerConfig, Heartbeat, Limits, Polling, Pool, PoolConfig, Pruner,
+    PrunerConfig, Publisher, PublisherConfig, Reaper, ReaperConfig, RequestLimits, SenderConfig,
+    Source,
 };
 use relay_domain::url_guard::Policy;
 use relay_store::Store;
@@ -159,6 +160,69 @@ async fn main() -> anyhow::Result<()> {
     )? as u64);
     let heartbeat = Arc::new(Heartbeat::new(store.clone(), heartbeat_interval));
 
+    // Where work is discovered. Polling Postgres unless a broker is configured, and
+    // polling on its own is a complete Relay — the broker is for when one node is not
+    // enough, not a dependency of the smallest deployment.
+    //
+    // Connecting is fatal here on purpose. Every other optional dependency in this
+    // binary is logged and carried on, but a broker that was asked for and cannot be
+    // reached would silently fall back to polling, and a fleet of nodes all quietly
+    // polling is a different system from the one that was deployed.
+    let (source, publisher): (Arc<dyn Source>, Option<Arc<Publisher>>) =
+        match relay_broker::Config::from_env() {
+            None => (Arc::new(Polling::new(store.clone())), None),
+            Some(broker_config) => {
+                tracing::info!(
+                    url = %broker_config.url,
+                    stream = %broker_config.stream,
+                    group = %broker_config.group,
+                    "broker mode"
+                );
+                let broker: Arc<dyn relay_broker::Broker> =
+                    Arc::new(relay_broker::RedisStreams::connect(broker_config).await?);
+                let consumer = ConsumerConfig {
+                    block: Duration::from_millis(env_usize("RELAY_BROKER_BLOCK_MS", 500)? as u64),
+                    reclaim_idle: Duration::from_secs(env_usize(
+                        "RELAY_BROKER_RECLAIM_IDLE_SECS",
+                        60,
+                    )? as u64),
+                    reclaim_every: Duration::from_secs(env_usize(
+                        "RELAY_BROKER_RECLAIM_EVERY_SECS",
+                        15,
+                    )? as u64),
+                };
+                // Named after the worker, so Redis's per-consumer bookkeeping lines up
+                // with the process it belongs to. Two processes sharing a name could
+                // each reclaim the other's in-flight work immediately.
+                let name = std::env::var("RELAY_CONSUMER_NAME")
+                    .unwrap_or_else(|_| format!("consumer-{}", uuid::Uuid::new_v4()));
+                tracing::info!(consumer = %name, "joined the consumer group");
+
+                // Every node publishes as well as consumes. `SKIP LOCKED` means they
+                // split the outbox rather than announcing each row several times, and
+                // a fleet with no publisher would deliver nothing at all.
+                let publisher = Arc::new(Publisher::new(
+                    store.clone(),
+                    broker.clone(),
+                    PublisherConfig {
+                        batch: env_usize("RELAY_OUTBOX_BATCH", 256)? as i64,
+                        idle: Duration::from_millis(env_usize("RELAY_OUTBOX_IDLE_MS", 100)? as u64),
+                        stale_after: Duration::from_secs(
+                            env_usize("RELAY_OUTBOX_STALE_SECS", 60)? as u64
+                        ),
+                        sweep_every: Duration::from_secs(
+                            env_usize("RELAY_OUTBOX_SWEEP_SECS", 30)? as u64
+                        ),
+                    },
+                ));
+
+                (
+                    Arc::new(BrokerSource::new(store.clone(), broker, name, consumer)),
+                    Some(publisher),
+                )
+            }
+        };
+
     tracing::info!(
         workers = config.workers,
         batch_size = config.batch_size,
@@ -218,11 +282,19 @@ async fn main() -> anyhow::Result<()> {
 
     // Returns once cancelled and everything in flight has finished or hit the
     // deadline.
-    Pool::with_config(store, config, sender_config)
+    let publisher_loop = publisher.map(|publisher| {
+        let cancel = cancel.clone();
+        tokio::spawn(async move { publisher.run(cancel).await })
+    });
+
+    Pool::with_source(store, config, sender_config, source)
         .run(cancel)
         .await;
     let _ = reaper_loop.await;
     let _ = pruner_loop.await;
+    if let Some(publisher_loop) = publisher_loop {
+        let _ = publisher_loop.await;
+    }
     // Stops beating as the process winds down, so the API reports unready within the
     // staleness window rather than advertising a dispatcher that has gone.
     let _ = heartbeat_loop.await;
