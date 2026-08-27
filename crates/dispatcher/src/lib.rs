@@ -42,7 +42,7 @@ pub mod outbox;
 pub mod source;
 
 pub use outbox::{Publisher, PublisherConfig};
-pub use source::{Claimed, Polling, Receipt, Source};
+pub use source::{BrokerSource, Claimed, ConsumerConfig, Polling, Receipt, Source};
 
 /// Customer error pages can be enormous. Store enough to debug with, no more.
 const SNIPPET_BYTES: usize = 2048;
