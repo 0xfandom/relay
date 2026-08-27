@@ -178,3 +178,122 @@ async fn a_body_inside_the_cap_is_accepted(pool: PgPool) {
 
     assert_eq!(resp.status(), 202);
 }
+
+// ------------------------------------------------------------------ transports
+
+async fn register_full(addr: SocketAddr, body: serde_json::Value) -> (u16, Value) {
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/endpoints"))
+        .json(&body)
+        .send()
+        .await
+        .expect("register");
+    let status = resp.status().as_u16();
+    (status, resp.json().await.unwrap_or(Value::Null))
+}
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn a_chat_endpoint_is_registered_by_address_and_token(pool: PgPool) {
+    let addr = serve(AppState::new(Store::from_pool(pool))).await;
+
+    let (status, body) = register_full(
+        addr,
+        serde_json::json!({
+            "url": "telegram://-1001234567890",
+            "transport": "telegram",
+            "secret": "123456:AAHfake_bot_token",
+        }),
+    )
+    .await;
+
+    assert_eq!(status, 201, "got {body}");
+    assert_eq!(body["transport"], "telegram");
+    // The stored address, not the built URL. The bot token is a path segment in
+    // Telegram's own scheme, and a URL is returned here, stored on every dead letter
+    // and written into a span on every send.
+    assert_eq!(body["url"], "telegram://-1001234567890");
+    // And the token is not echoed back. The caller sent it; returning it would put
+    // their own credential in a response body for no gain.
+    assert!(body["secret"].is_null(), "got {body}");
+}
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn a_chat_endpoint_without_a_token_is_refused(pool: PgPool) {
+    let addr = serve(AppState::new(Store::from_pool(pool))).await;
+
+    let (status, body) = register_full(
+        addr,
+        serde_json::json!({ "url": "discord://998877665544", "transport": "discord" }),
+    )
+    .await;
+
+    // Refused now rather than accepted and then permanently failing at send time for
+    // a reason the caller never sees.
+    assert_eq!(status, 400);
+    assert!(error(&body).contains("token"), "got {body}");
+}
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn a_malformed_chat_address_is_refused_at_registration(pool: PgPool) {
+    let addr = serve(AppState::new(Store::from_pool(pool))).await;
+
+    for url in ["telegram://", "-1001234567890", "https://example.com"] {
+        let (status, body) = register_full(
+            addr,
+            serde_json::json!({ "url": url, "transport": "telegram", "secret": "tok" }),
+        )
+        .await;
+        assert_eq!(status, 400, "{url:?} should be refused");
+        // The rejection names the shape that would work, because "invalid" alone
+        // sends the caller to the source.
+        assert!(error(&body).contains("telegram://<chat_id>"), "got {body}");
+    }
+}
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn an_unknown_transport_is_refused(pool: PgPool) {
+    let addr = serve(AppState::new(Store::from_pool(pool))).await;
+    let (status, body) = register_full(
+        addr,
+        serde_json::json!({ "url": "slack://general", "transport": "slack", "secret": "t" }),
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert!(error(&body).contains("telegram"), "got {body}");
+}
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn a_chat_endpoint_is_checked_against_the_url_it_will_actually_use(pool: PgPool) {
+    // The strict policy requires HTTPS on port 443. A chat address is neither a URL
+    // nor a port, so the only way this check means anything is if it runs against the
+    // *built* destination — which for Telegram is `https://api.telegram.org/...` and
+    // passes, where the stored `telegram://…` would have failed for the wrong reason.
+    let addr = serve(AppState::new(Store::from_pool(pool))).await;
+    let (status, body) = register_full(
+        addr,
+        serde_json::json!({
+            "url": "telegram://-1001234567890",
+            "transport": "telegram",
+            "secret": "tok",
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "got {body}");
+}
+
+#[sqlx::test(migrations = "../store/migrations")]
+async fn an_http_endpoint_still_gets_a_generated_secret(pool: PgPool) {
+    let addr = serve(AppState::new(Store::from_pool(pool))).await;
+    let (status, body) = register_full(
+        addr,
+        serde_json::json!({ "url": "https://example.com/hook" }),
+    )
+    .await;
+
+    assert_eq!(status, 201, "got {body}");
+    assert_eq!(body["transport"], "http", "http is the default");
+    // Relay generates the signing key rather than accepting one, so a weak secret is
+    // never the caller's decision to get wrong.
+    let secret = body["secret"].as_str().expect("a generated secret");
+    assert!(secret.starts_with("whsec_"));
+}

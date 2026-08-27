@@ -35,6 +35,7 @@ fn config(request: RequestLimits) -> SenderConfig {
             per_endpoint: 1024,
         },
         request,
+        transports: Default::default(),
         // Off: these tests fail the same endpoint repeatedly and a trip would
         // replace the behaviour under test with a deferral.
         breaker: None,

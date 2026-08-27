@@ -43,6 +43,7 @@ fn config(breaker: Option<breaker::Policy>) -> SenderConfig {
         policy: Policy::permissive(),
         // Off: a token shortage would look exactly like a breaker deferral here.
         request: RequestLimits::default(),
+        transports: Default::default(),
         rate_limit: false,
         limits: Limits {
             max_in_flight: 1024,

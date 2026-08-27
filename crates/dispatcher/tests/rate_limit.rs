@@ -33,6 +33,7 @@ fn limited() -> SenderConfig {
         },
         policy: Policy::permissive(),
         request: RequestLimits::default(),
+        transports: Default::default(),
         rate_limit: true,
         // Breaker off: several of these tests fail one endpoint repeatedly on
         // purpose, and tripping it would replace the behaviour under test with a
@@ -328,6 +329,7 @@ async fn switching_the_limiter_off_removes_the_ceiling(pool: PgPool) {
     // something real. Off is a deliberate load-test setting, never a default.
     let unlimited = SenderConfig {
         request: RequestLimits::default(),
+        transports: Default::default(),
         rate_limit: false,
         // Breaker off: several of these tests fail one endpoint repeatedly on
         // purpose, and tripping it would replace the behaviour under test with a
