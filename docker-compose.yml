@@ -85,6 +85,15 @@ services:
       # mistaken for a dead process.
       RELAY_HEARTBEAT_INTERVAL_SECS: ${RELAY_HEARTBEAT_INTERVAL_SECS:-5}
       RELAY_LOG_FORMAT: ${RELAY_LOG_FORMAT:-json}
+      # Empty means polling, which is the default and a complete Relay on its own.
+      # Set it to `redis://redis:6379` to run a fleet through the broker instead:
+      #
+      #   RELAY_BROKER_URL=redis://redis:6379 docker compose up -d dispatcher
+      #
+      # Empty reads as "off" rather than "connect to nowhere", so the line can stay.
+      RELAY_BROKER_URL: ${RELAY_BROKER_URL:-}
+      RELAY_BROKER_STREAM: ${RELAY_BROKER_STREAM:-relay:deliveries}
+      RELAY_BROKER_GROUP: ${RELAY_BROKER_GROUP:-relay-dispatchers}
     ports:
       - "9091:9091"
     # Long enough for in-flight deliveries to finish rather than be cut off. The
