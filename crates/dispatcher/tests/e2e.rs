@@ -282,6 +282,7 @@ fn local() -> SenderConfig {
         // Rate limiting off: these tests are about something else, and a deferral
         // would add attempt rows for requests that were never made.
         request: RequestLimits::default(),
+        transports: Default::default(),
         rate_limit: false,
         // Breaker off: several of these tests fail one endpoint repeatedly on
         // purpose, and tripping it would replace the behaviour under test with a

@@ -39,6 +39,7 @@ fn config() -> SenderConfig {
             per_endpoint: 1024,
         },
         request: RequestLimits::default(),
+        transports: Default::default(),
         breaker: None,
     }
 }

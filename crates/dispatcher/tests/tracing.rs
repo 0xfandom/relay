@@ -116,6 +116,7 @@ fn config() -> SenderConfig {
         },
         policy: Policy::permissive(),
         request: RequestLimits::default(),
+        transports: Default::default(),
         rate_limit: false,
         limits: Limits {
             max_in_flight: 1024,

@@ -54,6 +54,7 @@ fn config(breaker: Option<breaker::Policy>, rate_limit: bool) -> SenderConfig {
         },
         policy: Policy::permissive(),
         request: RequestLimits::default(),
+        transports: Default::default(),
         rate_limit,
         limits: Limits {
             max_in_flight: 1024,
