@@ -5,11 +5,22 @@
 # queue and the send path. They are separate targets with separate `instance`
 # labels, which is the ordinary shape for a service made of more than one process.
 #
-# The targets are on the host rather than in this compose file. Relay itself runs
-# with `cargo run` during development, and giving it a container here would mean
-# rebuilding an image on every edit to watch a graph move. `host.docker.internal`
-# is resolved by Docker Desktop and, on Linux, by the `host-gateway` alias set in
-# the compose file.
+# One target each, reached through the host rather than by compose service name, and
+# that is deliberate. Relay is run two ways — the full stack from `docker compose up`,
+# and `cargo run` on the host when the code is what is changing — and the host address
+# is correct for both. Compose publishes 8080 and 9091 to the host, so this address
+# reaches the container when the stack is up and the host process when it is not.
+#
+# Scraping the service names instead would have meant listing both, and both would
+# have answered: the published port makes `host.docker.internal:9091` and
+# `dispatcher:9091` the same process. Prometheus would have scraped it twice under
+# two instance labels and doubled every panel that sums across instances.
+#
+# Only one of the two can be running at a time regardless — they would collide on the
+# port — which is what makes a single target unambiguous.
+#
+# `host.docker.internal` is resolved by Docker Desktop and, on Linux, by the
+# `host-gateway` alias set in the compose file.
 
 global:
   # Fast for a laptop, not for production. The point of a short interval here is
