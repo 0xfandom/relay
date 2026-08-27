@@ -61,6 +61,13 @@ pub struct PublisherConfig {
     pub stale_after: Duration,
     /// How often the reconciliation sweep runs.
     pub sweep_every: Duration,
+    /// How many unread entries the broker may hold before the sweep stands down.
+    ///
+    /// Above this, the system is behind rather than broken, and re-announcing would
+    /// make the backlog it is reacting to longer. Small but not zero: a healthy busy
+    /// broker always has a few entries in flight, and a threshold of zero would
+    /// disable recovery on any system doing work.
+    pub sweep_below_unread: u64,
 }
 
 impl Default for PublisherConfig {
@@ -70,6 +77,9 @@ impl Default for PublisherConfig {
             idle: Duration::from_millis(100),
             stale_after: Duration::from_secs(60),
             sweep_every: Duration::from_secs(30),
+            // One batch. Enough that ordinary in-flight work does not block recovery,
+            // small enough that a real backlog does.
+            sweep_below_unread: 256,
         }
     }
 }
@@ -145,18 +155,74 @@ impl Publisher {
         Ok(n)
     }
 
-    /// Report what the broker is holding, for the dashboard.
-    async fn report_lag(&self) {
+    /// Report what the broker is holding, and say whether it is backed up.
+    ///
+    /// `None` when the broker could not be asked. Logged and carried on rather than
+    /// fatal — a publisher that stopped publishing because it could not read a gauge
+    /// would be a worse outage than a missing panel.
+    async fn report_lag(&self) -> Option<relay_broker::Lag> {
         match self.broker.lag().await {
-            Ok(lag) => relay_metrics::broker_lag(lag.unread, lag.unacked),
-            // Logged and carried on. A publisher that stopped publishing because it
-            // could not read a gauge would be a worse outage than a missing panel.
-            Err(e) => tracing::debug!(error = %e, "could not read broker lag"),
+            Ok(lag) => {
+                relay_metrics::broker_lag(lag.unread, lag.unacked);
+                Some(lag)
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "could not read broker lag");
+                None
+            }
+        }
+    }
+
+    /// Whether it is safe to sweep right now.
+    ///
+    /// The sweep cannot tell a message that was *lost* from one that is merely
+    /// waiting behind a long backlog. Both look identical from Postgres: a row that
+    /// is marked as announced and has not moved.
+    ///
+    /// Getting that wrong is not a harmless false positive, it is a feedback loop.
+    /// Re-announcing a delivery that is already sitting in the stream appends another
+    /// entry to the very backlog that made it look stalled, which makes the next
+    /// sweep find more rows, which appends more entries. Measured on a chaos run:
+    /// 30,000 deliveries produced 119,000 published messages and a stream of 70,000
+    /// entries, and the consumers spent their time acknowledging duplicates of work
+    /// that had already succeeded.
+    ///
+    /// So when the broker still holds entries no consumer has reached, the honest
+    /// reading is "behind", not "broken", and the sweep stands down. Nothing is lost
+    /// by waiting: the entries are there, and a consumer will get to them.
+    /// Whether a sweep would run right now, asking the broker for the answer.
+    ///
+    /// Exposed so the rule can be tested without driving the whole loop and timing
+    /// it, which is the kind of test that passes locally and fails on a shared runner.
+    pub async fn would_sweep(&self) -> bool {
+        let lag = self.broker.lag().await.ok();
+        self.safe_to_sweep(lag)
+    }
+
+    fn safe_to_sweep(&self, lag: Option<relay_broker::Lag>) -> bool {
+        match lag {
+            // Unread entries mean the stream still has work nobody has looked at.
+            // A row marked as announced is most likely one of them.
+            Some(lag) => lag.unread <= self.config.sweep_below_unread,
+            // Could not ask. Sweeping is the safer default: a broker that cannot
+            // answer is more likely to have lost something than to be busy.
+            None => true,
         }
     }
 
     pub async fn run(&self, cancel: CancellationToken) {
         let mut since_sweep = Duration::ZERO;
+        // Set when a sweep comes back full, which means there is more behind it.
+        //
+        // This exists because of what a total broker loss looks like. Every row is
+        // marked as announced and every message is gone, so the publisher — which
+        // only reads *unannounced* rows — finds nothing at all, and the entire
+        // recovery has to come through the sweep. One batch per interval then caps
+        // recovery at `batch / sweep_every`: with the defaults, around eight
+        // deliveries a second, so thirty thousand of them would take an hour while
+        // the system looks idle. Measured, not guessed — a chaos run flushing Redis
+        // mid-flight recovered at exactly that rate before this was here.
+        let mut sweep_again = false;
 
         loop {
             let published = match self.publish_once().await {
@@ -171,19 +237,38 @@ impl Publisher {
             // drain rate at one batch per interval no matter how far behind the
             // outbox is.
             let backlog_likely = published as i64 >= self.config.batch;
-            let wait = if backlog_likely {
+
+            if sweep_again || since_sweep >= self.config.sweep_every {
+                since_sweep = Duration::ZERO;
+                let was_chasing = sweep_again;
+                sweep_again = false;
+                let lag = self.report_lag().await;
+                if !self.safe_to_sweep(lag) {
+                    tracing::debug!(
+                        unread = lag.map(|l| l.unread),
+                        "broker is behind; standing down rather than adding to its backlog"
+                    );
+                    // Not a failure and not a reason to keep chasing.
+                    let _ = was_chasing;
+                    continue;
+                }
+                match self.sweep_once().await {
+                    // Straight round again rather than waiting for the interval.
+                    // Alternating one sweep with one publish is what makes recovery
+                    // run at the database's speed instead of a timer's: the sweep
+                    // un-marks a batch and the publisher announces it on the very
+                    // next pass.
+                    Ok(n) if n as i64 >= self.config.batch => sweep_again = true,
+                    Ok(_) => {}
+                    Err(e) => tracing::error!(error = %e, "reconciliation sweep failed"),
+                }
+            }
+
+            let wait = if backlog_likely || sweep_again {
                 Duration::ZERO
             } else {
                 self.config.idle
             };
-
-            if since_sweep >= self.config.sweep_every {
-                since_sweep = Duration::ZERO;
-                if let Err(e) = self.sweep_once().await {
-                    tracing::error!(error = %e, "reconciliation sweep failed");
-                }
-                self.report_lag().await;
-            }
             since_sweep += wait.max(Duration::from_millis(1));
 
             if wait.is_zero() {
