@@ -213,6 +213,8 @@ async fn main() -> anyhow::Result<()> {
                         sweep_every: Duration::from_secs(
                             env_usize("RELAY_OUTBOX_SWEEP_SECS", 30)? as u64
                         ),
+                        sweep_below_unread: env_usize("RELAY_OUTBOX_SWEEP_BELOW_UNREAD", 256)?
+                            as u64,
                     },
                 ));
 
