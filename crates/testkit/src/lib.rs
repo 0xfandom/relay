@@ -43,7 +43,12 @@ pub struct Receiver {
 }
 
 struct Inner {
-    secret: String,
+    /// Mutable, because of the order the real flow happens in: Relay generates an
+    /// endpoint's signing secret and returns it exactly once at creation, so a
+    /// receiver cannot possibly have been started with it. Without a way to set it
+    /// afterwards the documented walkthrough would need the receiver restarted in the
+    /// middle, which is not a walkthrough anybody follows.
+    secret: Mutex<String>,
     /// Delivery ids seen, in order. Duplicates are kept deliberately: proving that
     /// retries reuse one id requires seeing the repeats.
     received: Mutex<Vec<String>>,
@@ -104,7 +109,7 @@ impl Receiver {
     pub fn new(secret: impl Into<String>) -> Self {
         Self {
             inner: Arc::new(Inner {
-                secret: secret.into(),
+                secret: Mutex::new(secret.into()),
                 received: Mutex::new(Vec::new()),
                 bodies: Mutex::new(Vec::new()),
                 signatures: Mutex::new(Vec::new()),
@@ -168,6 +173,7 @@ impl Receiver {
             // chat transports store it apart from the address.
             .route("/bot{token}/sendMessage", post(telegram))
             .route("/webhooks/{id}/{token}", post(discord))
+            .route("/secret", post(set_secret))
             .route("/toggle", post(toggle))
             .route("/received", get(received))
             .with_state(self.clone())
@@ -241,7 +247,12 @@ async fn verify(State(state): State<Receiver>, headers: HeaderMap, body: Bytes) 
         .split(',')
         .filter_map(|p| p.trim().strip_prefix("v1="))
         .any(|candidate| {
-            relay_domain::signature::verify(state.inner.secret.as_bytes(), ts, &body, candidate)
+            relay_domain::signature::verify(
+                state.inner.secret.lock().unwrap().as_bytes(),
+                ts,
+                &body,
+                candidate,
+            )
         });
 
     if ok {
@@ -447,6 +458,21 @@ async fn big_body(
 
 /// Fails or succeeds according to [`Receiver::set_failing`]. Starts out failing, so
 /// a test can trip a breaker and then bring the endpoint back.
+/// Point the receiver at a different signing secret.
+///
+/// Exists because the secret only comes into being when the endpoint is registered.
+/// A real receiver reads it from its own configuration; this one has to be told.
+async fn set_secret(State(state): State<Receiver>, body: String) -> Response {
+    let value = body.trim().to_string();
+    if value.is_empty() {
+        return (StatusCode::BAD_REQUEST, "empty secret").into_response();
+    }
+    *state.inner.secret.lock().unwrap() = value;
+    // Deliberately does not echo it back. This is a toy, but echoing a signing secret
+    // into a response body is a habit worth not forming.
+    (StatusCode::NO_CONTENT, "").into_response()
+}
+
 async fn toggle(State(state): State<Receiver>, headers: HeaderMap, body: Bytes) -> Response {
     let _in_flight = record(&state, &headers, &body);
     if state.inner.failing.load(Ordering::SeqCst) {
