@@ -1403,7 +1403,13 @@ impl Pool {
     ///
     /// Returns the number claimed, or `None` when every worker is busy — the
     /// caller must then wait for capacity rather than spinning on the database.
+    // `debug` rather than the default `info`, because this span opens and closes on
+    // every idle poll whether or not there was anything to claim. At the default poll
+    // interval that is four log lines a second, forever, on a system doing nothing —
+    // which drowns the lines that matter and costs real money to store. It still
+    // exists at `debug`, so a delivery's parent batch is one `RUST_LOG` away.
     #[tracing::instrument(
+        level = "debug",
         name = "batch",
         skip_all,
         fields(worker = %self.worker_id(), claimed = tracing::field::Empty)
@@ -1733,7 +1739,11 @@ impl Heartbeat {
             // dispatcher has never reported" until the first write lands, so
             // sleeping first would add a full interval of self-inflicted unreadiness
             // to every deploy.
-            if let Err(e) = self.store.heartbeat(relay_store::HEARTBEAT_DISPATCHER).await {
+            if let Err(e) = self
+                .store
+                .heartbeat(relay_store::HEARTBEAT_DISPATCHER)
+                .await
+            {
                 // Logged and carried on. A failed beat is almost always the database
                 // being briefly unavailable, and in that case the API cannot read the
                 // heartbeat either — it is already reporting unready for a better

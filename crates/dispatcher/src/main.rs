@@ -1,8 +1,8 @@
 use std::{sync::Arc, time::Duration};
 
 use relay_dispatcher::{
-    Heartbeat, Limits, Pool, PoolConfig, Pruner, PrunerConfig, Reaper, ReaperConfig,
-    RequestLimits, SenderConfig,
+    Heartbeat, Limits, Pool, PoolConfig, Pruner, PrunerConfig, Reaper, ReaperConfig, RequestLimits,
+    SenderConfig,
 };
 use relay_domain::url_guard::Policy;
 use relay_store::Store;
