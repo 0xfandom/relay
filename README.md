@@ -137,6 +137,53 @@ Without the header nothing is deduplicated, which is deliberate: two identical
 bodies a second apart may be a retry or two real orders, and only the producer
 knows which.
 
+## Where a delivery can go
+
+An endpoint has a transport. It decides how the request is built and **nothing
+else** — the same retries, backoff, breaker, rate limit and attempt log apply to all
+three. That is the test of whether the abstraction sits in the right place: if a
+transport ever needed to change retry or breaker behaviour, it wouldn't.
+
+| Transport | `url` holds | `secret` holds | Body | Signed |
+| --- | --- | --- | --- | --- |
+| `http` | the customer's URL | the signing key | their bytes, verbatim | yes |
+| `telegram` | `telegram://<chat_id>` | the bot token | `{"chat_id", "text"}` | no |
+| `discord` | `discord://<webhook_id>` | the webhook token | `{"content"}` | no |
+
+```bash
+curl -X POST 127.0.0.1:8080/v1/endpoints \
+  -H 'content-type: application/json' \
+  -d '{"url":"telegram://-1001234567890","transport":"telegram",
+       "secret":"123456:AA...","event_types":["order.paid"]}'
+```
+
+**The credential never goes in the URL.** Telegram's bot token and Discord's webhook
+token are both path segments in their native form — `https://api.telegram.org/bot<TOKEN>/sendMessage`
+— and a URL is returned by the admin API, stored on every dead letter, and written
+into a span on every send. Storing one there would leak it into three places at once,
+none of which anyone would think to redact. So an endpoint stores its *address* in
+`url` and its *credential* in `secret`, which is already the redacted type.
+
+The real URL is assembled at send time, used, and never written down. `Outbound`
+carries a `display_url` alongside it with the credential replaced, and that is the
+one the span and the logs get — two fields rather than a redacting function called at
+each log site, for the same reason `Secret` has no `Display`.
+
+**Signing is a property of the transport.** The HMAC exists so a receiver can prove a
+payload came from us. Telegram already knows it did, because the request arrived
+carrying our bot token, so a signature there is ceremony. Only `http` signs.
+
+**Chat messages are text, so the payload is rendered rather than forwarded.** This is
+the one place Relay's never-re-encode rule does not apply — and it is allowed not to
+apply precisely because nothing here is signed. The event type leads the message,
+since in a channel carrying four kinds of event that is the first thing anyone needs.
+Each platform's own limit is respected (Telegram 4096, Discord 2000) by truncating on
+a character boundary: a message that arrives cut short is worth more than one that
+does not arrive.
+
+The SSRF policy is applied to the **built** URL, not the stored address — for a chat
+transport those are different strings, and only the built one can be resolved.
+
 ## Signature format
 
 Modelled on Stripe's scheme, so existing receiver implementations apply.
