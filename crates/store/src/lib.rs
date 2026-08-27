@@ -182,6 +182,41 @@ impl Store {
         Ok(())
     }
 
+    /// Record that `component` is still running, as of now.
+    ///
+    /// `now()` is Postgres's clock, not this process's, and that is the point. The
+    /// reader compares the stamp against the same clock, so the two never have to
+    /// agree with each other — only with the database. A heartbeat written from the
+    /// writer's clock and read against the reader's turns any skew between two
+    /// machines into a false outage.
+    pub async fn heartbeat(&self, component: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO relay_heartbeat (component, at) VALUES ($1, now())
+             ON CONFLICT (component) DO UPDATE SET at = now()",
+        )
+        .bind(component)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// How long ago `component` last reported, in seconds.
+    ///
+    /// `None` means it has never reported at all, which readiness must treat as
+    /// stale rather than as fresh: on a cold start the dispatcher may genuinely not
+    /// be up yet, and answering "ready" before anything can deliver is exactly the
+    /// lie the endpoint exists to prevent.
+    pub async fn heartbeat_age(&self, component: &str) -> Result<Option<f64>> {
+        let age: Option<f64> = sqlx::query_scalar(
+            "SELECT EXTRACT(EPOCH FROM (now() - at))::double precision
+               FROM relay_heartbeat WHERE component = $1",
+        )
+        .bind(component)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(age)
+    }
+
     /// Take ownership of a delivery before sending it.
     ///
     /// This is what stops the send loop from re-sending the same delivery when a
@@ -1301,6 +1336,14 @@ impl Store {
         Ok(row)
     }
 }
+
+/// The name the dispatcher heartbeats under.
+///
+/// Lives here rather than in either process, because the writer and the reader are
+/// different binaries and the string has to match exactly. A typo on either side is
+/// silent: the writer updates a row nobody reads, and the reader finds no row and
+/// reports the dispatcher dead forever.
+pub const HEARTBEAT_DISPATCHER: &str = "dispatcher";
 
 /// One table's on-disk footprint.
 #[derive(Debug, Clone, sqlx::FromRow)]
