@@ -1,0 +1,19 @@
+[package]
+name = "relay-broker"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+async-trait = "0.1.92"
+# `connection-manager` reconnects on its own. Without it a Redis restart leaves
+# every consumer holding a dead socket, and the outbox's whole claim is that losing
+# the broker is survivable.
+redis = { version = "1.6.0", default-features = false, features = ["tokio-comp", "connection-manager", "streams"] }
+thiserror = "2.0.19"
+tracing = "0.1.44"
+tokio = { version = "1.53.1", features = ["rt", "time", "macros"] }
+uuid = { version = "1.19.0", features = ["v4"] }
+
+[dev-dependencies]
+redis = { version = "1.6.0", default-features = false, features = ["tokio-comp", "connection-manager", "streams"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time"] }
