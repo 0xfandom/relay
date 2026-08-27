@@ -117,6 +117,7 @@ async fn main() -> anyhow::Result<()> {
         rate_limit,
         limits,
         request,
+        transports: Default::default(),
         breaker,
     };
 

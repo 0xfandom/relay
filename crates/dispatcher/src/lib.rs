@@ -29,6 +29,7 @@ use relay_domain::{
     breaker::{self, State as BreakerState},
     outcome::{Class, Disposition, Transport, classify_status, classify_transport, disposition},
     rate_limit::{Rate, Take},
+    transport,
     url_guard::{Policy, Refused},
 };
 use relay_store::{AttemptResult, DeadReason, DeliveryStatus, PendingDelivery, Store};
@@ -252,6 +253,12 @@ pub struct SenderConfig {
     pub limits: Limits,
     /// The bounds on any one request: three timeouts and two size caps.
     pub request: RequestLimits,
+    /// The transports this sender can deliver through.
+    ///
+    /// Carried in the config rather than looked up statically so a test can point
+    /// the chat transports at a local stand-in — otherwise they could only be
+    /// exercised against the real Telegram, which means once, by hand, never again.
+    pub transports: transport::Registry,
     /// When to stop delivering to an endpoint entirely, and how long for.
     ///
     /// `None` disables the breaker. Off only for tests that are exercising something
@@ -268,6 +275,7 @@ impl Default for SenderConfig {
             rate_limit: true,
             limits: Limits::default(),
             request: RequestLimits::default(),
+            transports: transport::Registry::default(),
             breaker: Some(breaker::Policy::default()),
         }
     }
@@ -591,6 +599,51 @@ impl Sender {
         })
     }
 
+    /// Record a delivery whose request could not be built at all.
+    ///
+    /// Permanent, and separated from a refusal because it is a different problem: a
+    /// refusal means the destination is somewhere Relay will not go, this means the
+    /// endpoint's own configuration is malformed. `telegram://` with no chat id
+    /// after it will never become well formed by waiting.
+    async fn unbuildable(
+        &self,
+        p: PendingDelivery,
+        error: transport::BuildError,
+    ) -> Result<Outcome, SendError> {
+        let error = error.to_string();
+        tracing::warn!(
+            delivery_id = %p.delivery_id,
+            endpoint_id = %p.endpoint_id,
+            transport = %p.transport,
+            reason = %error,
+            "cannot build a request for this endpoint"
+        );
+
+        self.store
+            .finish_attempt(
+                p.delivery_id,
+                p.attempt,
+                AttemptResult::Dead {
+                    reason: DeadReason::PermanentFailure,
+                },
+                None,
+                0,
+                Disposition::Permanent.as_str(),
+                Some(&error),
+                None,
+                &self.worker_id,
+            )
+            .await?;
+
+        relay_metrics::attempt(Disposition::Permanent.as_str());
+        relay_metrics::dead(DeadReason::PermanentFailure.as_str());
+        Ok(Outcome::Failed {
+            class: Class::Permanent,
+            status: None,
+            error,
+        })
+    }
+
     /// Record a delivery that was never sent because its destination was refused.
     async fn refuse(&self, p: PendingDelivery, refused: Refused) -> Result<Outcome, SendError> {
         let error = refused.to_string();
@@ -800,14 +853,6 @@ impl Sender {
                 .await;
         }
 
-        // A refused destination is permanent — no amount of retrying makes an
-        // internal address public — and nothing about the refusal is written back to
-        // the caller's response snippet, because the party who chose the URL must not
-        // learn what is listening at it.
-        if let Err(refused) = self.check_destination(&p.url).await {
-            return self.refuse(p, refused).await;
-        }
-
         // Held for the whole request and released on the way out, panic included:
         // both permits live in `_slot` and a dropped permit is returned to its
         // semaphore however the scope is left.
@@ -815,35 +860,64 @@ impl Sender {
 
         let timestamp = unix_now();
 
-        // Sign the stored bytes, and send those same bytes. Nothing in between may
-        // parse and re-encode the payload: JSON key order is not defined, and the
-        // signature covers bytes rather than meaning.
+        // Which transport, and what request it wants made. Everything after this
+        // point is identical whatever the destination is — that is the whole test of
+        // whether the abstraction sits in the right place.
         //
-        // During a rotation's overlap window both secrets sign, and both signatures
-        // go out together. There is no ordering of "we switch" and "they switch"
-        // that avoids failed deliveries otherwise: whichever side moves first is
-        // wrong until the other catches up.
-        let signatures = sign_all(&p, timestamp);
+        // An unknown transport string reads as HTTP. The CHECK constraint makes it
+        // unreachable, and delivering the payload verbatim is the safe direction to
+        // be wrong in: the alternative is refusing to deliver anything to an endpoint
+        // because of a typo in a column.
+        let kind = transport::Kind::parse(&p.transport).unwrap_or(transport::Kind::Http);
+        let outbound = match self.config.transports.build(
+            kind,
+            &transport::Context {
+                address: &p.url,
+                credential: p.secret.reveal(),
+                previous_credential: p.previous_secret.as_ref().map(|s| s.reveal()),
+                event_type: &p.event_type,
+                delivery_id: &p.delivery_id.to_string(),
+                payload: &p.raw_payload,
+                timestamp,
+            },
+        ) {
+            Ok(outbound) => outbound,
+            // Permanent. Every way this fails describes the endpoint's own
+            // configuration, and no amount of retrying makes a malformed chat id well
+            // formed.
+            Err(e) => return self.unbuildable(p, e).await,
+        };
+
+        // Checked against the URL that will actually be connected to, not the one
+        // stored: for a chat transport those are different strings, and only the
+        // built one can be resolved. A refused destination is permanent — no amount
+        // of retrying makes an internal address public — and nothing about the
+        // refusal reaches the response snippet, because the party who chose the
+        // address must not learn what is listening at it.
+        if let Err(refused) = self.check_destination(&outbound.url).await {
+            return self.refuse(p, refused).await;
+        }
 
         let started = Instant::now();
         // The one span that covers time spent on somebody else's server. Everything
         // else in a delivery is microseconds; if a delivery took ten seconds, it was
         // this.
-        let send = tracing::info_span!("send", url = %p.url, status = tracing::field::Empty);
-        let result = self
-            .client
-            .post(&p.url)
-            .header("content-type", "application/json")
-            .header("relay-timestamp", timestamp.to_string())
-            // A list, not a single value. The receiver matches on any entry, so it
-            // can move to the new secret at any point inside the window and nothing
-            // fails on either side of the switch.
-            .header("relay-signature", &signatures)
-            // Stable across every attempt of this delivery. If this changed per
-            // attempt, receivers could not deduplicate retries.
-            .header("relay-delivery-id", p.delivery_id.to_string())
-            .header("relay-event-type", &p.event_type)
-            .body(p.raw_payload.clone())
+        //
+        // The *display* URL, never the real one: a Telegram bot token and a Discord
+        // webhook token are both path segments, and this line would otherwise put one
+        // in every log aggregator we own.
+        let send = tracing::info_span!(
+            "send",
+            url = %outbound.display_url,
+            transport = kind.as_str(),
+            status = tracing::field::Empty
+        );
+        let mut request = self.client.post(&outbound.url);
+        for (name, value) in &outbound.headers {
+            request = request.header(*name, value);
+        }
+        let result = request
+            .body(outbound.body)
             .send()
             .instrument(send.clone())
             .await;
@@ -1861,27 +1935,6 @@ impl Pruner {
 /// data one day too long is the cheap direction to be wrong in.
 fn as_days(d: Duration) -> i32 {
     d.as_secs().div_ceil(DAY).max(1) as i32
-}
-
-/// The `Relay-Signature` header value: every secret currently valid for this
-/// endpoint, newest first.
-///
-/// Newest first because a receiver that only checks the first entry — which the
-/// format permits but the docs discourage — should be checking the one it will end
-/// up on, not the one it is leaving.
-fn sign_all(p: &PendingDelivery, timestamp: i64) -> String {
-    let mut out = format!(
-        "v1={}",
-        relay_domain::signature::sign(p.secret.expose(), timestamp, &p.raw_payload)
-    );
-    if let Some(previous) = &p.previous_secret {
-        out.push(',');
-        out.push_str(&format!(
-            "v1={}",
-            relay_domain::signature::sign(previous.expose(), timestamp, &p.raw_payload)
-        ));
-    }
-    out
 }
 
 fn unix_now() -> i64 {
