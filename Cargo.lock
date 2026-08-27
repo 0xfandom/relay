@@ -1604,6 +1604,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "relay-loadtest"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "relay-dispatcher",
+ "relay-domain",
+ "relay-store",
+ "relay-testkit",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "relay-metrics"
 version = "0.1.0"
 dependencies = [
