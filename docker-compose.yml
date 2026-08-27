@@ -1,3 +1,12 @@
+# The whole system, in one command: `docker compose up`.
+#
+# Everything here is bound to localhost and configured for a laptop. Two settings in
+# particular — anonymous Grafana and `RELAY_ALLOW_PRIVATE_ENDPOINTS` — would be
+# serious mistakes anywhere else, and each is marked where it appears.
+#
+# Defaults are written as `${VAR:-default}` so every knob can be overridden from the
+# shell or a `.env` file without editing this file. See `docs/deployment.md`.
+
 services:
   postgres:
     image: postgres:17-alpine
@@ -7,6 +16,8 @@ services:
       POSTGRES_PASSWORD: relay
       POSTGRES_DB: relay
     ports:
+      # 5433 on the host, because a developer machine usually already has something
+      # on 5432. Inside the compose network it is the ordinary 5432.
       - "5433:5432"
     volumes:
       - relay-pgdata:/var/lib/postgresql/data
@@ -16,9 +27,92 @@ services:
       timeout: 3s
       retries: 15
 
-  # Scrapes both Relay processes and keeps a day of history. Long enough to look
-  # back at a chaos scenario over lunch, short enough that nobody has to think about
-  # disk on a laptop.
+  api:
+    build:
+      context: .
+      target: api
+    container_name: relay-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://relay:relay@postgres:5432/relay}
+      RELAY_API_BIND: 0.0.0.0:8080
+      # The receiver in this file lives on a private Docker network address, so
+      # without this every delivery in the demo stack is refused before it is sent.
+      #
+      # It is also the single most dangerous setting in Relay. It lets a customer
+      # register an endpoint pointing at anything reachable from this container,
+      # including a cloud provider's metadata service, which answers without
+      # authentication to whatever asks. Never set outside a laptop.
+      RELAY_ALLOW_PRIVATE_ENDPOINTS: ${RELAY_ALLOW_PRIVATE_ENDPOINTS:-true}
+      # How patient readiness is. See `crates/api/src/readiness.rs` for why the queue
+      # check measures lateness rather than depth.
+      RELAY_HEARTBEAT_MAX_AGE_SECS: ${RELAY_HEARTBEAT_MAX_AGE_SECS:-20}
+      RELAY_MAX_LATENESS_SECS: ${RELAY_MAX_LATENESS_SECS:-60}
+      RELAY_LOG_FORMAT: ${RELAY_LOG_FORMAT:-json}
+    ports:
+      - "8080:8080"
+    healthcheck:
+      # Liveness, not readiness. Readiness depends on the dispatcher, and a
+      # healthcheck that failed while the dispatcher was starting would restart the
+      # API in a loop for as long as the dispatcher took to come up.
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  dispatcher:
+    build:
+      context: .
+      target: dispatcher
+    container_name: relay-dispatcher
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://relay:relay@postgres:5432/relay}
+      RELAY_METRICS_BIND: 0.0.0.0:9091
+      # Same warning as above, and the same reason: the receiver is on a private
+      # address. This is the process that actually makes the request.
+      RELAY_ALLOW_PRIVATE_ENDPOINTS: ${RELAY_ALLOW_PRIVATE_ENDPOINTS:-true}
+      RELAY_WORKERS: ${RELAY_WORKERS:-32}
+      RELAY_BATCH_SIZE: ${RELAY_BATCH_SIZE:-32}
+      RELAY_DB_CONNECTIONS: ${RELAY_DB_CONNECTIONS:-8}
+      # Comfortably under the API's staleness threshold, so one slow write is not
+      # mistaken for a dead process.
+      RELAY_HEARTBEAT_INTERVAL_SECS: ${RELAY_HEARTBEAT_INTERVAL_SECS:-5}
+      RELAY_LOG_FORMAT: ${RELAY_LOG_FORMAT:-json}
+    ports:
+      - "9091:9091"
+    # Long enough for in-flight deliveries to finish rather than be cut off. The
+    # binary handles SIGTERM and drains; the default 10s would SIGKILL it mid-drain,
+    # leaving rows `inflight` for the reaper to rescue on the next start.
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9091/metrics"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  # A destination to point endpoints at, so the stack is useful with nothing else
+  # installed. Verifies signatures and records what it received.
+  receiver:
+    build:
+      context: .
+      target: testkit
+    container_name: relay-receiver
+    environment:
+      RELAY_TESTKIT_BIND: 0.0.0.0:9099
+      RELAY_TESTKIT_SECRET: ${RELAY_TESTKIT_SECRET:-whsec_test}
+    ports:
+      - "9099:9099"
+    restart: unless-stopped
+
   prometheus:
     image: prom/prometheus:v3.1.0
     container_name: relay-prometheus
@@ -30,12 +124,13 @@ services:
       - relay-prometheus-data:/prometheus
     ports:
       - "9090:9090"
-    # Relay runs on the host with `cargo run`, not in this file: giving it a
-    # container would mean rebuilding an image on every edit to watch a graph move.
-    # Docker Desktop resolves `host.docker.internal` on its own; this alias is what
-    # makes the same config work on Linux.
+    # Prometheus scrapes Relay through the host rather than by service name, so that
+    # one config works whether the stack is running here or under `cargo run`. See
+    # `ops/prometheus/prometheus.yml` for why that avoids double-counting. Docker
+    # Desktop resolves this name on its own; the alias is what makes it work on Linux.
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    restart: unless-stopped
 
   grafana:
     image: grafana/grafana:11.5.2
@@ -58,6 +153,7 @@ services:
       - ./ops/grafana/dashboards:/var/lib/grafana/dashboards:ro
     ports:
       - "3000:3000"
+    restart: unless-stopped
 
 volumes:
   relay-pgdata:
