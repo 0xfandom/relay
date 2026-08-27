@@ -710,6 +710,34 @@ carries one and prints `<redacted>`, so a `?pending` added in a hurry during an
 incident cannot leak one — and a field added to those rows later is redacted by
 default rather than exposed by default.
 
+## Running more than one dispatcher
+
+Relay polls Postgres by default, and one node doing that is a complete system. When
+one node is not enough, a Redis Streams broker carries "this delivery is ready" to a
+fleet — set `RELAY_BROKER_URL` and the dispatcher switches modes.
+
+Two rules make it safe.
+
+**The broker is a transport, never the record.** Every message is a row id for a row
+already committed in Postgres. No payload, no headers, no signing secret reaches
+Redis. Everything it holds can be rebuilt from the `deliveries` table, and a
+reconciliation sweep is the code that does the rebuilding — flushing Redis entirely,
+three times, mid-run, loses zero deliveries.
+
+**A message is not ownership.** Receiving one means "this delivery is worth trying",
+not "you exclusively own it". Redis redelivers, and reclaim deliberately hands the
+same message to a second consumer. What actually prevents a double send is the
+database lease that was already there: a consumer claims the row before it sends, and
+a claim that loses acknowledges the message and moves on.
+
+The sweep has one non-obvious rule: it stands down while the broker still holds
+unread entries. A row that was announced and has not moved looks the same whether its
+message was lost or is queued behind a backlog, and re-announcing the second case
+appends to the very backlog that made it look stalled. That feedback loop was
+measured before the guard existed.
+
+See [docs/deployment.md](docs/deployment.md).
+
 ## Health and readiness
 
 `GET /healthz` asks whether the process is running and nothing else. `GET /readyz`
