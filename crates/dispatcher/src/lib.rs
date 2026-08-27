@@ -38,8 +38,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 use uuid::Uuid;
 
+pub mod outbox;
 pub mod source;
 
+pub use outbox::{Publisher, PublisherConfig};
 pub use source::{Claimed, Polling, Receipt, Source};
 
 /// Customer error pages can be enormous. Store enough to debug with, no more.
@@ -125,6 +127,14 @@ pub enum SendError {
     Store(#[from] relay_store::StoreError),
     #[error("http client: {0}")]
     Client(#[from] reqwest::Error),
+    /// The broker could not be reached.
+    ///
+    /// A `String` rather than the broker's own error type, so this crate does not
+    /// have to depend on the broker's error shape in order to name the failure. It is
+    /// also never fatal: a broker outage delays deliveries, and the reconciliation
+    /// sweep is what makes sure it does not lose them.
+    #[error("broker: {0}")]
+    Broker(String),
 }
 
 /// What happened to one attempt.

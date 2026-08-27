@@ -1682,6 +1682,7 @@ dependencies = [
  "chrono",
  "rand 0.10.2",
  "relay-api",
+ "relay-broker",
  "relay-domain",
  "relay-metrics",
  "relay-store",
