@@ -203,6 +203,38 @@ what keeps that reversible.
 | `RELAY_BROKER_URL` | unset | Unset or empty means polling. Setting it switches on the broker |
 | `RELAY_BROKER_STREAM` | `relay:deliveries` | |
 | `RELAY_BROKER_GROUP` | `relay-dispatchers` | Every dispatcher joins the same one, which is what makes them split the work rather than each receiving everything |
+| `RELAY_CONSUMER_NAME` | random per process | Must be stable per process and distinct between them: Redis tracks unacknowledged messages per consumer name |
+| `RELAY_BROKER_BLOCK_MS` | `500` | How long a read waits for a message |
+| `RELAY_BROKER_RECLAIM_IDLE_SECS` | `60` | Before another consumer may take over a held message. Keep above the request timeout, or reclaim takes work from consumers that are merely slow |
+| `RELAY_BROKER_RECLAIM_EVERY_SECS` | `15` | |
+| `RELAY_OUTBOX_BATCH` | `256` | Rows announced per pass, and the most a crash between marking and publishing can strand |
+| `RELAY_OUTBOX_IDLE_MS` | `100` | |
+| `RELAY_OUTBOX_STALE_SECS` | `60` | How long a row may sit announced before the sweep assumes its message is gone |
+| `RELAY_OUTBOX_SWEEP_SECS` | `30` | |
+| `RELAY_OUTBOX_SWEEP_BELOW_UNREAD` | `256` | The sweep stands down above this many unread entries. See below |
+
+### Losing the broker
+
+Every message is a row id for a row already committed in Postgres, so nothing the
+broker holds is irreplaceable. A reconciliation sweep finds rows that were announced
+and never moved, and announces them again. Flushing Redis entirely, three times,
+mid-run, loses zero deliveries — that is a test, not a claim.
+
+The sweep has one rule that is not obvious. **It stands down while the broker still
+holds unread entries.** A row that is marked as announced and has not moved looks
+identical whether its message was lost or is merely queued behind a long backlog, and
+sweeping the second case appends another entry to the very backlog that made it look
+stalled — which makes the next sweep find more rows, which appends more entries.
+
+That is a positive feedback loop, and it was measured before the guard existed: a
+chaos run of 30,000 deliveries produced 119,000 published messages and a stream of
+70,000 entries, with consumers spending their time acknowledging duplicates of work
+that had already succeeded. With the guard, the same run produces 51,000 published
+messages, 21,000 stream entries, and 64 stale messages instead of 4,768.
+
+`relay_outbox_requeued_total` should sit at zero. Anything else means messages are
+going missing between the publisher and the consumers, and it is the only thing that
+would say so.
 
 ## Configuration
 
