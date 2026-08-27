@@ -1700,6 +1700,57 @@ impl Reaper {
     }
 }
 
+/// Tells the rest of the system that this process is still running.
+///
+/// Sits alongside the queue's own health signal rather than replacing it, and the
+/// distinction is the point. Lateness in the queue says whether work is draining —
+/// but it says nothing at all while the queue is empty, so a dispatcher that died
+/// overnight is indistinguishable from one with nothing to do. This closes that gap
+/// and nothing else: a beat proves the process is looping, never that the loop is
+/// achieving anything.
+///
+/// Written to the database rather than exposed on a port because the reader is the
+/// API, which already has a connection to the database and may be on another host.
+/// A heartbeat endpoint would mean the API needs to know where every dispatcher
+/// lives, which is a service discovery problem invented to avoid one `UPDATE`.
+pub struct Heartbeat {
+    store: Store,
+    interval: Duration,
+}
+
+impl Heartbeat {
+    /// Wants to be a small fraction of the API's staleness threshold, so a single
+    /// slow write is not mistaken for a dead process.
+    pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(5);
+
+    pub fn new(store: Store, interval: Duration) -> Self {
+        Self { store, interval }
+    }
+
+    pub async fn run(&self, cancel: CancellationToken) {
+        loop {
+            // Beat first, sleep second. On a cold start the API reports "the
+            // dispatcher has never reported" until the first write lands, so
+            // sleeping first would add a full interval of self-inflicted unreadiness
+            // to every deploy.
+            if let Err(e) = self.store.heartbeat(relay_store::HEARTBEAT_DISPATCHER).await {
+                // Logged and carried on. A failed beat is almost always the database
+                // being briefly unavailable, and in that case the API cannot read the
+                // heartbeat either — it is already reporting unready for a better
+                // reason.
+                tracing::warn!(error = %e, "heartbeat failed");
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(self.interval) => {}
+                _ = cancel.cancelled() => {
+                    tracing::info!("heartbeat stopped");
+                    return;
+                }
+            }
+        }
+    }
+}
+
 /// How long each kind of history is kept, and how often the sweep runs.
 ///
 /// Four windows rather than one, because the four are kept for different reasons and
