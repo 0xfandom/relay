@@ -44,6 +44,7 @@ fn publisher_config() -> PublisherConfig {
         idle: Duration::from_millis(10),
         stale_after: Duration::from_secs(60),
         sweep_every: Duration::from_secs(30),
+        sweep_below_unread: 256,
     }
 }
 
