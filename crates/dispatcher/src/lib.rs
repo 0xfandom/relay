@@ -38,6 +38,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 use uuid::Uuid;
 
+pub mod source;
+
+pub use source::{Claimed, Polling, Receipt, Source};
+
 /// Customer error pages can be enormous. Store enough to debug with, no more.
 const SNIPPET_BYTES: usize = 2048;
 
@@ -1364,6 +1368,10 @@ impl Default for PoolConfig {
 pub struct Pool {
     sender: Sender,
     config: PoolConfig,
+    /// Where work is discovered. Polling Postgres by default; a broker when one is
+    /// configured. The rest of this type cannot tell the difference, which is what
+    /// makes the choice a deployment decision rather than a rewrite.
+    source: Arc<dyn Source>,
     /// Permits are the in-flight bound. A task holds one for the whole request and
     /// releases it on completion, so the claim loop can ask how much room is left
     /// before deciding how many rows to take.
@@ -1387,11 +1395,28 @@ impl Pool {
     }
 
     pub fn with_config(store: Store, config: PoolConfig, sender: SenderConfig) -> Self {
+        let source = Arc::new(Polling::new(store.clone()));
+        Self::with_source(store, config, sender, source)
+    }
+
+    /// As [`Pool::with_config`], reading work from somewhere other than the database.
+    pub fn with_source(
+        store: Store,
+        config: PoolConfig,
+        sender: SenderConfig,
+        source: Arc<dyn Source>,
+    ) -> Self {
         Self {
             sender: Sender::with_config(store, sender),
+            source,
             capacity: Arc::new(Semaphore::new(config.workers)),
             config,
         }
+    }
+
+    /// Which source this pool is reading from, for logs.
+    pub fn mode(&self) -> &'static str {
+        self.source.mode()
     }
 
     /// Which process this pool's claims are stamped with.
@@ -1432,16 +1457,19 @@ impl Pool {
         // every other worker until it is finished or its lease expires, so claiming
         // ahead of capacity strands work behind whatever is already running.
         let want = free.min(self.config.batch_size);
+        // Asked of the source rather than of the store, so the same loop runs whether
+        // work is discovered by polling Postgres or pushed by a broker. Everything
+        // after this line is identical in both modes, which is the property the
+        // abstraction exists to guarantee.
         let batch = self
-            .sender
-            .store
-            .claim_batch(want as i64, &self.sender.worker_id)
+            .source
+            .claim(want, &self.sender.worker_id)
             .instrument(tracing::debug_span!("claim", want))
             .await?;
         let claimed = batch.len();
         tracing::Span::current().record("claimed", claimed);
 
-        for pending in batch {
+        for Claimed { pending, receipt } in batch {
             // Shutdown can land between claiming a batch and handing it out. Those
             // rows are `inflight` with nobody about to send them, so give them back
             // now rather than leaving the reaper to find them in half a minute.
@@ -1449,6 +1477,14 @@ impl Pool {
                 if let Err(e) = self.sender.store.release(pending.delivery_id).await {
                     tracing::error!(delivery_id = %pending.delivery_id, error = %e,
                         "could not release a claimed delivery during shutdown");
+                }
+                // Settled even though nothing was sent. The row went back to the
+                // queue, so the message has done its job; leaving it unacknowledged
+                // would strand it in the broker until a reclaim, for a delivery that
+                // is already pending again.
+                if let Err(e) = self.source.settle(&receipt).await {
+                    tracing::error!(delivery_id = %pending.delivery_id, error = %e,
+                        "could not settle a released delivery during shutdown");
                 }
                 continue;
             }
@@ -1462,6 +1498,7 @@ impl Pool {
                 .await
                 .expect("semaphore is never closed");
             let sender = self.sender.clone();
+            let source = self.source.clone();
             // Built here, inside the batch span, so it is parented to the claim that
             // produced it — and then attached to the task explicitly.
             //
@@ -1489,6 +1526,14 @@ impl Pool {
                         // not be resent while the outcome is unknown. The reaper
                         // returns it once the lease expires.
                         Err(e) => tracing::error!(error = %e, "delivery failed"),
+                    }
+                    // Settled on both paths. This says "this worker is finished with
+                    // the message", not "the webhook arrived" — the delivery's own
+                    // fate is already recorded in Postgres, and a message left
+                    // unacknowledged because the send failed would simply be
+                    // redelivered to attempt a row that is no longer due.
+                    if let Err(e) = source.settle(&receipt).await {
+                        tracing::error!(error = %e, "could not settle a finished delivery");
                     }
                 }
                 .instrument(span),

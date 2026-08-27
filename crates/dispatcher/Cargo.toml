@@ -4,6 +4,7 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
+async-trait = "0.1.92"
 anyhow = "1.0.104"
 chrono = { version = "0.4.45", features = ["clock"], default-features = false }
 rand = "0.10.2"
