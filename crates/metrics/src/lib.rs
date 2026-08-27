@@ -78,6 +78,13 @@ const INGEST_SECONDS: &str = "relay_ingest_duration_seconds";
 
 /// Open deliveries by status.
 const QUEUE_DEPTH: &str = "relay_queue_depth";
+const OUTBOX_PUBLISHED: &str = "relay_outbox_published_total";
+const OUTBOX_REQUEUED: &str = "relay_outbox_requeued_total";
+const OUTBOX_BACKLOG: &str = "relay_outbox_backlog";
+const BROKER_LAG: &str = "relay_broker_lag";
+const BROKER_CONSUMED: &str = "relay_broker_consumed_total";
+const BROKER_RECLAIMED: &str = "relay_broker_reclaimed_total";
+const BROKER_STALE: &str = "relay_broker_stale_messages_total";
 /// Pending deliveries whose time has come. The gap against `QUEUE_DEPTH{status=
 /// "pending"}` is work that is waiting *on purpose* — a backoff, a deferral —
 /// rather than work nobody is getting to.
@@ -251,6 +258,12 @@ async fn refresh_gauges(store: &Store) -> Result<(), relay_store::StoreError> {
     metrics::gauge!(DEFAULT_PARTITION_ROWS)
         .set(store.attempts_in_default_partition().await? as f64);
 
+    // Separate from `relay_queue_depth{status="pending"}` on purpose. A large backlog
+    // here means the *publisher* is behind; a large pending count with this at zero
+    // means the consumers are. One number could not tell those apart, and they have
+    // opposite fixes.
+    metrics::gauge!(OUTBOX_BACKLOG).set(store.outbox_backlog().await? as f64);
+
     let b = store.breaker_stats().await?;
     metrics::gauge!(BREAKERS, "state" => "closed").set(b.closed as f64);
     metrics::gauge!(BREAKERS, "state" => "open").set(b.open as f64);
@@ -296,6 +309,25 @@ fn describe() {
         "POST /v1/events duration"
     );
     metrics::describe_gauge!(QUEUE_DEPTH, "Open deliveries by status");
+    metrics::describe_counter!(OUTBOX_PUBLISHED, "Deliveries announced to the broker");
+    metrics::describe_counter!(
+        OUTBOX_REQUEUED,
+        "Announced deliveries the sweep put back; should stay at zero"
+    );
+    metrics::describe_gauge!(
+        OUTBOX_BACKLOG,
+        "Due deliveries not yet announced; the publisher's own backlog"
+    );
+    metrics::describe_gauge!(BROKER_LAG, "Messages in the broker, by state");
+    metrics::describe_counter!(BROKER_CONSUMED, "Messages taken from the broker");
+    metrics::describe_counter!(
+        BROKER_RECLAIMED,
+        "Messages taken over from a consumer that stopped reporting"
+    );
+    metrics::describe_counter!(
+        BROKER_STALE,
+        "Messages naming a delivery that was no longer claimable"
+    );
     metrics::describe_gauge!(QUEUE_DUE, "Pending deliveries whose time has come");
     metrics::describe_gauge!(
         QUEUE_OLDEST,
@@ -342,6 +374,15 @@ fn initialise() {
         Deferral::ProbeInFlight,
     ] {
         metrics::counter!(DEFERRALS, "reason" => reason.as_str()).increment(0);
+    }
+    for m in [
+        OUTBOX_PUBLISHED,
+        OUTBOX_REQUEUED,
+        BROKER_CONSUMED,
+        BROKER_RECLAIMED,
+        BROKER_STALE,
+    ] {
+        metrics::counter!(m).increment(0);
     }
     // The values `deliveries.dead_reason` is constrained to.
     for reason in ["permanent_failure", "attempts_exhausted", "refused"] {
@@ -453,6 +494,52 @@ pub fn rescued(n: u64) {
 
 pub fn keys_pruned(n: u64) {
     metrics::counter!(KEYS_PRUNED).increment(n);
+}
+
+/// Deliveries announced to the broker.
+pub fn published(n: u64) {
+    metrics::counter!(OUTBOX_PUBLISHED).increment(n);
+}
+
+/// Deliveries the reconciliation sweep put back, because they were announced and
+/// then nothing happened.
+///
+/// Should stay at zero. Anything else means messages are going missing between the
+/// publisher and the consumers, and this is the only thing that would say so.
+pub fn requeued(n: u64) {
+    metrics::counter!(OUTBOX_REQUEUED).increment(n);
+}
+
+/// Messages taken from the broker.
+pub fn consumed(n: u64) {
+    metrics::counter!(BROKER_CONSUMED).increment(n);
+}
+
+/// Messages taken over from a consumer that stopped reporting.
+pub fn reclaimed(n: u64) {
+    metrics::counter!(BROKER_RECLAIMED).increment(n);
+}
+
+/// How much the broker is holding.
+///
+/// Set by whoever is talking to the broker rather than refreshed on scrape with the
+/// database gauges, because the metrics crate deliberately knows nothing about the
+/// broker — it is optional, and a Relay without one should not carry a Redis client.
+///
+/// Absent entirely when no broker is configured, which is the honest answer: zero
+/// would claim an empty broker where there is none.
+pub fn broker_lag(unread: u64, unacked: u64) {
+    metrics::gauge!(BROKER_LAG, "state" => "unread").set(unread as f64);
+    metrics::gauge!(BROKER_LAG, "state" => "unacked").set(unacked as f64);
+}
+
+/// Messages naming a delivery that was no longer claimable.
+///
+/// The ordinary cost of at-least-once delivery, not an error: a redelivered message,
+/// or one whose row another consumer already took. Worth counting because a ratio
+/// that climbs means the broker is redelivering far more than it should.
+pub fn stale_message() {
+    metrics::counter!(BROKER_STALE).increment(1);
 }
 
 /// How an ingest request ended.
