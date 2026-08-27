@@ -1317,6 +1317,110 @@ impl Store {
         Ok(row)
     }
 
+    // ------------------------------------------------------------------ outbox
+
+    /// Mark up to `limit` due deliveries as announced, and return their ids.
+    ///
+    /// Marks *before* the caller publishes, which is the safe order of the two.
+    /// Publishing first and marking second would announce a row again on every pass
+    /// until the mark landed; marking first can only lose an announcement, and a lost
+    /// announcement is a row still sitting `pending` that the reconciliation sweep
+    /// finds and republishes. One failure mode is bounded duplication of work nobody
+    /// asked for, the other is a delay with a floor. The second is recoverable by
+    /// something already in the design.
+    ///
+    /// `SKIP LOCKED` so two publishers never fight over the same rows: each takes
+    /// what the other has not, exactly as the delivery claim does.
+    pub async fn mark_queued(&self, limit: i64) -> Result<Vec<Uuid>> {
+        let ids: Vec<Uuid> = sqlx::query_scalar(
+            "UPDATE deliveries SET queued_at = now()
+              WHERE id IN (
+                  SELECT id FROM deliveries
+                   WHERE status = 'pending'
+                     AND queued_at IS NULL
+                     AND next_attempt_at <= now()
+                   ORDER BY next_attempt_at
+                   LIMIT $1
+                   FOR UPDATE SKIP LOCKED
+              )
+              RETURNING id",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(ids)
+    }
+
+    /// Undo [`Store::mark_queued`] for rows that could not be published.
+    ///
+    /// The difference between a Redis outage costing a few milliseconds and costing
+    /// however long the reconciliation sweep's staleness threshold is. The sweep is
+    /// the safety net for a hard crash between the mark and the publish; this handles
+    /// the ordinary case, where the publish simply returned an error.
+    pub async fn unmark_queued(&self, ids: &[Uuid]) -> Result<u64> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let result = sqlx::query("UPDATE deliveries SET queued_at = NULL WHERE id = ANY($1)")
+            .bind(ids)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Deliveries that are due and have not been announced yet.
+    ///
+    /// The outbox's own backlog, which is not the same as the queue depth: a large
+    /// number here means the publisher is behind, while a large `pending` with this
+    /// at zero means the consumers are.
+    pub async fn outbox_backlog(&self) -> Result<i64> {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*)::bigint FROM deliveries
+              WHERE status = 'pending' AND queued_at IS NULL AND next_attempt_at <= now()",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(n)
+    }
+
+    /// Rows announced a while ago that are still sitting `pending`.
+    ///
+    /// The gap between what was announced and what the broker actually holds: a
+    /// crash between marking and publishing, a message Redis dropped, a flushed
+    /// database. Marking them unannounced is what lets the publisher pick them up
+    /// again on its next pass.
+    ///
+    /// Returns how many were reset.
+    pub async fn requeue_stale(&self, older_than: Duration, limit: i64) -> Result<u64> {
+        let result = sqlx::query(
+            "UPDATE deliveries SET queued_at = NULL
+              WHERE id IN (
+                  SELECT id FROM deliveries
+                   WHERE status = 'pending'
+                     AND queued_at IS NOT NULL
+                     AND queued_at < now() - make_interval(secs => $1)
+                   ORDER BY queued_at
+                   LIMIT $2
+                   FOR UPDATE SKIP LOCKED
+              )",
+        )
+        .bind(older_than.as_secs_f64())
+        .bind(limit)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// When a delivery was announced to the broker, if it has been.
+    pub async fn queued_at(&self, id: Uuid) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+        let at: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar("SELECT queued_at FROM deliveries WHERE id = $1")
+                .bind(id)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(at)
+    }
+
     /// How many endpoints are in each breaker state.
     ///
     /// Read from the endpoints table rather than from the sender's memory, because
