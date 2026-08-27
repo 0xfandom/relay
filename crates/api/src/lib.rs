@@ -21,8 +21,10 @@ use relay_store::{Cursor, DeadLetterFilter, DeadReason, DeliveryStatus, Store};
 use serde::{Deserialize, Serialize};
 
 pub mod extract;
+pub mod readiness;
 
 use extract::RawBody;
+use readiness::{Facts, Thresholds};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -53,6 +55,8 @@ pub struct AppState {
     /// shared: an address accepted here and unbuildable at send time is a delivery
     /// that dies for a reason the caller was never told.
     pub transports: transport::Registry,
+    /// How patient `/readyz` is before it reports a stall.
+    pub readiness: Thresholds,
 }
 
 /// Long enough for a customer to notice, change a value and deploy.
@@ -68,6 +72,7 @@ impl AppState {
             max_body_bytes: extract::MAX_BODY_BYTES,
             secret_overlap: DEFAULT_SECRET_OVERLAP,
             transports: transport::Registry::default(),
+            readiness: Thresholds::default(),
         }
     }
 
@@ -79,6 +84,7 @@ impl AppState {
             max_body_bytes: extract::MAX_BODY_BYTES,
             secret_overlap: DEFAULT_SECRET_OVERLAP,
             transports: transport::Registry::default(),
+            readiness: Thresholds::default(),
         }
     }
 }
@@ -86,6 +92,7 @@ impl AppState {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .route("/v1/endpoints", post(create_endpoint))
         .route("/v1/endpoints/{id}/rotate-secret", post(rotate_secret))
         .route(
@@ -150,11 +157,58 @@ fn ingest_outcome(response: &Response) -> relay_metrics::Ingest {
     }
 }
 
-async fn healthz(State(state): State<AppState>) -> Response {
-    match state.store.ping().await {
-        Ok(()) => (StatusCode::OK, "ok").into_response(),
-        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
-    }
+/// Is this process alive?
+///
+/// Nothing more. An orchestrator restarts what fails liveness, so checking a shared
+/// dependency here would mean that one database blip restarts every replica at once
+/// — turning a recoverable outage into a total one. The database *is* checked, but
+/// in `/readyz`, where failing means "send traffic elsewhere" rather than "kill it".
+async fn healthz() -> Response {
+    (StatusCode::OK, "ok").into_response()
+}
+
+/// Should this instance be sent traffic?
+///
+/// Gathers the three facts and hands them to [`readiness::evaluate`], which owns
+/// every judgement. The split is deliberate: this function can only be tested
+/// against a live stack, and the rules deciding when to pull a node out of rotation
+/// deserve tests that run in microseconds.
+async fn readyz(State(state): State<AppState>) -> Response {
+    let facts = match state.store.ping().await {
+        Err(e) => Facts::DatabaseDown(e.to_string()),
+        Ok(()) => {
+            // Two queries rather than one join. They are cheap, independent, and
+            // reporting "the database is up but readiness could not be computed"
+            // would be a worse answer than either of them failing on its own.
+            let heartbeat_age_secs = state
+                .store
+                .heartbeat_age(readiness::DISPATCHER)
+                .await
+                .unwrap_or(None);
+            let lateness_secs = state
+                .store
+                .queue_stats()
+                .await
+                .ok()
+                .and_then(|s| s.oldest_pending_age_secs);
+            Facts::Live {
+                heartbeat_age_secs,
+                lateness_secs,
+            }
+        }
+    };
+
+    let report = readiness::evaluate(&facts, state.readiness);
+    // 503 rather than 500: this is a state the instance is expected to recover from,
+    // and it is what every load balancer and orchestrator reads as "not now".
+    let code = if report.ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    // The body says which check failed. A bare 503 sends whoever is paged to read
+    // the source to find out what was even being measured.
+    (code, Json(report)).into_response()
 }
 
 // ------------------------------------------------------------------ endpoints

@@ -44,6 +44,9 @@ async fn main() -> anyhow::Result<()> {
         max_body_bytes,
         secret_overlap,
         transports: Default::default(),
+        // How long the API waits before deciding the dispatcher has stopped
+        // dispatching. See `readiness` for why lateness rather than depth.
+        readiness: relay_api::readiness::Thresholds::from_env(),
     };
 
     // Logged and carried on rather than fatal. An API that refuses to accept events
