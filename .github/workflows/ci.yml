@@ -8,6 +8,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   DATABASE_URL: postgres://relay:relay@localhost:5432/relay
+  REDIS_URL: redis://127.0.0.1:6379
 
 jobs:
   test:
@@ -24,6 +25,21 @@ jobs:
           - 5432:5432
         options: >-
           --health-cmd "pg_isready -U relay -d relay"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+
+      # The broker's tests run against a real Redis. Everything worth asserting
+      # there — that a consumer group splits work rather than duplicating it, that
+      # reclaim moves ownership after an idle threshold — is a property of Redis, so
+      # a fake would only assert that the commands were spelled the way we spell
+      # them.
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
           --health-interval 2s
           --health-timeout 3s
           --health-retries 15
