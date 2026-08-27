@@ -167,6 +167,43 @@ pass and `503` with a body naming the failure if not:
 A dispatcher that is alive but wedged fails the third check while passing the second.
 That combination is the whole point of having both.
 
+## Running more than one dispatcher
+
+Relay polls Postgres by default, and one node doing that is a complete system. When
+one node is not enough there is a second mode: a Redis Streams broker carries "this
+delivery is ready" to a fleet of dispatchers.
+
+```bash
+docker compose up -d redis
+RELAY_BROKER_URL=redis://redis:6379 docker compose up -d dispatcher
+```
+
+Three things are worth knowing before turning it on.
+
+**The broker is a transport, never the record.** Every message is a row id for a row
+that is already committed in Postgres. No payload, no headers, no signing secret ever
+reaches Redis — losing it, or someone reading it, exposes a list of UUIDs. Everything
+it holds can be rebuilt by reading the `deliveries` table.
+
+**A message is not ownership.** Receiving one means "this delivery is worth trying",
+not "you exclusively own it". Redis redelivers, and reclaim deliberately hands the
+same message to a second consumer when the first goes quiet. The thing that actually
+prevents two sends is the database lease that was already there: a consumer claims
+the row before it sends, and a claim that loses acknowledges the message and moves
+on. At-least-once delivery plus "send immediately" is at-least-twice.
+
+**Redis Streams rather than Kafka.** Consumer groups, acknowledgements and
+idle-message reclaim in one container that starts in a second. Kafka's log semantics
+buy nothing until several independent systems want the same stream, and the
+operational footprint is disproportionate long before then. The `Broker` trait is
+what keeps that reversible.
+
+| Variable | Default | |
+|---|---|---|
+| `RELAY_BROKER_URL` | unset | Unset or empty means polling. Setting it switches on the broker |
+| `RELAY_BROKER_STREAM` | `relay:deliveries` | |
+| `RELAY_BROKER_GROUP` | `relay-dispatchers` | Every dispatcher joins the same one, which is what makes them split the work rather than each receiving everything |
+
 ## Configuration
 
 Everything is an environment variable, and every one has a working default. Compose

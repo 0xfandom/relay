@@ -50,6 +50,7 @@ crates/
   metrics/     every metric name, and the /metrics endpoint that renders them
   testkit/     configurable receiver for integration tests
   loadtest/    load generator and configuration sweep
+  broker/      Redis Streams transport behind a trait, for running a fleet
 docs/          deployment, configuration, and how to write a receiver
 ops/           Prometheus and Grafana provisioning
 Dockerfile     one builder, three runtime images
