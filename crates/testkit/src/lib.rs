@@ -173,6 +173,7 @@ impl Receiver {
             // chat transports store it apart from the address.
             .route("/bot{token}/sendMessage", post(telegram))
             .route("/webhooks/{id}/{token}", post(discord))
+            .route("/sink", post(sink))
             .route("/secret", post(set_secret))
             .route("/toggle", post(toggle))
             .route("/received", get(received))
@@ -260,6 +261,18 @@ async fn verify(State(state): State<Receiver>, headers: HeaderMap, body: Bytes) 
     } else {
         (StatusCode::UNAUTHORIZED, "bad signature").into_response()
     }
+}
+
+/// Answers `200` and remembers nothing but a count.
+///
+/// For the load test, and it exists because every other route here calls `record`,
+/// which appends the body, the path and the signature to three `Mutex<Vec<_>>` under
+/// one lock. That is exactly right for a test asserting on what arrived, and exactly
+/// wrong at a thousand requests a second: the lock becomes the narrowest thing in the
+/// system and the run measures the laboratory rather than Relay.
+async fn sink(State(state): State<Receiver>) -> Response {
+    state.inner.hits.fetch_add(1, Ordering::Relaxed);
+    (StatusCode::OK, "").into_response()
 }
 
 async fn always_500(State(state): State<Receiver>, headers: HeaderMap, body: Bytes) -> Response {
