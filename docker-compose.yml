@@ -99,6 +99,26 @@ services:
       start_period: 10s
     restart: unless-stopped
 
+  # Optional. Relay runs perfectly without it — one node polling Postgres is a
+  # complete system — and this is here for when one node is not enough. Nothing
+  # starts using it until `RELAY_BROKER_URL` is set.
+  #
+  # No persistence configured, deliberately. The broker is a transport and never the
+  # record: everything in it can be rebuilt from Postgres, so an AOF here would be
+  # paying for durability that is already paid for once.
+  redis:
+    image: redis:7.4-alpine
+    container_name: relay-redis
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    restart: unless-stopped
+
   # A destination to point endpoints at, so the stack is useful with nothing else
   # installed. Verifies signatures and records what it received.
   receiver:
