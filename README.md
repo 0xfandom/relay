@@ -49,6 +49,7 @@ crates/
   api/         axum ingest and admin endpoints
   metrics/     every metric name, and the /metrics endpoint that renders them
   testkit/     configurable receiver for integration tests
+  loadtest/    load generator and configuration sweep
 docs/          deployment, configuration, and how to write a receiver
 ops/           Prometheus and Grafana provisioning
 Dockerfile     one builder, three runtime images
@@ -729,6 +730,21 @@ only when nothing came to collect it.
 The heartbeat and the lateness check catch different failures, which is why both are
 there. A dispatcher that died overnight with an empty queue makes nothing late. A
 dispatcher wedged on a poisoned row goes on beating happily.
+
+## How fast it actually is
+
+5,000 deliveries a second sustained on a laptop with a p99 of 106 ms, and 6,781 a
+second draining a backlog, with zero lost across every run. The requirement was
+1,000.
+
+The bottleneck is not the worker pool. Sixteen times the workers buys 4% over
+sixteen of them, because a worker spends its life waiting on a socket. What matters
+is round trips to the database: claiming one row at a time costs two-thirds of the
+throughput, and raising the connection pool from 8 to 32 is worth more than
+quadrupling the workers.
+
+Method, the full configuration sweep, and what to change first are in
+[docs/load-test.md](docs/load-test.md).
 
 ## License
 
