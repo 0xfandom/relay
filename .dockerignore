@@ -1,0 +1,8 @@
+# `target` is tens of gigabytes and is rebuilt inside the image anyway. Sending it to
+# the daemon would dominate the build time before a single line was compiled.
+target
+.git
+.github
+BRIEF
+.env
+.DS_Store
