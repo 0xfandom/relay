@@ -49,14 +49,31 @@ crates/
   api/         axum ingest and admin endpoints
   metrics/     every metric name, and the /metrics endpoint that renders them
   testkit/     configurable receiver for integration tests
+docs/          deployment, configuration, and how to write a receiver
+ops/           Prometheus and Grafana provisioning
+Dockerfile     one builder, three runtime images
 ```
 
-## Build
+## Running the whole thing
 
-Requires a recent stable Rust toolchain.
+One command, from a clean machine to a working stack — API, dispatcher, Postgres,
+Prometheus, Grafana, and a receiver to deliver to.
 
 ```bash
-docker compose up -d       # Postgres on 5433, Prometheus on 9090, Grafana on 3000
+docker compose up --build
+curl -s localhost:8080/readyz | jq
+```
+
+The full walkthrough, every configuration variable, and what a real receiver has to
+implement are in [docs/deployment.md](docs/deployment.md).
+
+## Building and testing
+
+Requires a recent stable Rust toolchain. Compiling inside Docker on every edit is the
+slow loop, so run Postgres in a container and the code on the host:
+
+```bash
+docker compose up -d postgres
 export DATABASE_URL=postgres://relay:relay@localhost:5433/relay
 cargo test                 # unit tests plus end-to-end against a real database
 ```
@@ -64,7 +81,7 @@ cargo test                 # unit tests plus end-to-end against a real database
 `DATABASE_URL` is required: the store's tests create a throwaway database each, so
 that concurrent workers in one test cannot claim rows belonging to another.
 
-## Running locally
+## Running the processes by hand
 
 Three processes: the ingest API, the dispatcher, and a configurable receiver
 standing in for a customer endpoint.
@@ -93,6 +110,9 @@ curl -X POST 127.0.0.1:8080/v1/events \
   -d '{"type":"order.paid","amount":4999}'
 # 202 Accepted, with the event id and one delivery id per subscribed endpoint
 ```
+
+The endpoint's signing secret is returned once, at creation. Hand it to the receiver
+with `curl -X POST 127.0.0.1:9099/secret --data '<secret>'`, or it will answer `401`.
 
 The receiver exposes failure modes for testing delivery behaviour: `/always500`,
 `/slow?ms=`, `/flaky?pct=`, `/429?retry_after=`, `/bigbody?kb=`, `/trickle?ms=`
@@ -687,6 +707,28 @@ Signing secrets cannot reach the logs. `Debug` is written by hand for every row 
 carries one and prints `<redacted>`, so a `?pending` added in a hurry during an
 incident cannot leak one — and a field added to those rows later is redacted by
 default rather than exposed by default.
+
+## Health and readiness
+
+`GET /healthz` asks whether the process is running and nothing else. `GET /readyz`
+asks whether this instance should be sent traffic, and answers `503` with a body
+naming the failure when it should not.
+
+They are separate because an orchestrator restarts what fails liveness. A liveness
+probe that also checked the database would turn one database blip into every replica
+restarting at once.
+
+Readiness runs three checks: the database answers, the dispatcher has reported
+recently, and the queue is draining. The third is the interesting one. It measures
+*lateness* — how far past its due time the oldest pending delivery is — rather than
+depth, because depth lies in both directions: large and harmless while a burst
+drains, three rows and catastrophic when those three have been stuck for an hour.
+Every deliberate wait in Relay moves a row's due time forward, so a delivery is late
+only when nothing came to collect it.
+
+The heartbeat and the lateness check catch different failures, which is why both are
+there. A dispatcher that died overnight with an empty queue makes nothing late. A
+dispatcher wedged on a poisoned row goes on beating happily.
 
 ## License
 
