@@ -257,7 +257,15 @@ async fn a_delivery_is_never_sent_twice_by_the_same_loop() {
     let sender = Sender::with_config(f.store.clone(), local());
 
     let first = sender.deliver_by_id(deliveries[0]).await.unwrap();
-    assert_eq!(first, Some(Outcome::Succeeded { status: 200 }));
+    // The outcome is in the message because this assertion has fired once under a
+    // fully loaded machine, and `left == right` on its own cannot say whether the
+    // send failed, was deferred, or never happened. What it actually was decides
+    // whether the next occurrence is a real defect or a busy runner.
+    assert_eq!(
+        first,
+        Some(Outcome::Succeeded { status: 200 }),
+        "the first send did not succeed: {first:?}"
+    );
 
     // Same delivery, second pass: already claimed and finished, so nothing happens.
     let second = sender.deliver_by_id(deliveries[0]).await.unwrap();
