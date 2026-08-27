@@ -21,6 +21,7 @@ uuid = { version = "1.24.0", features = ["v4"] }
 
 [dev-dependencies]
 async-trait = "0.1.92"
+redis = { version = "1.6.0", default-features = false, features = ["tokio-comp", "streams"] }
 relay-broker = { path = "../broker" }
 axum = "0.8.9"
 # The tracing tests read the JSON a production deployment emits, not a

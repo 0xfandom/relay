@@ -1681,6 +1681,7 @@ dependencies = [
  "axum",
  "chrono",
  "rand 0.10.2",
+ "redis",
  "relay-api",
  "relay-broker",
  "relay-domain",
