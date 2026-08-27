@@ -13,6 +13,7 @@ use std::time::Duration;
 use relay_domain::{
     breaker::{self, Event, Health, Policy as BreakerPolicy, State as BreakerState},
     rate_limit::Rate,
+    transport,
 };
 use serde::Serialize;
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -131,7 +132,8 @@ const CLAIM_BATCH_SQL: &str = concat!(
             ep.rate_per_second AS rate_per_second,
             ep.burst      AS burst,
             ep.breaker_state AS breaker_state,
-            ep.breaker_probe_at AS breaker_probe_at
+            ep.breaker_probe_at AS breaker_probe_at,
+            ep.transport  AS transport
      FROM claimed c
      JOIN events    e  ON e.id  = c.event_id
      JOIN endpoints ep ON ep.id = c.endpoint_id"
@@ -304,20 +306,34 @@ impl Store {
         Ok(())
     }
 
+    /// Register an HTTP endpoint. The overwhelmingly common case.
     pub async fn create_endpoint(
         &self,
         url: &str,
         secret: &str,
         event_types: &[String],
     ) -> Result<Endpoint> {
+        self.create_endpoint_with(url, secret, event_types, transport::Kind::Http)
+            .await
+    }
+
+    /// Register an endpoint on a named transport.
+    pub async fn create_endpoint_with(
+        &self,
+        url: &str,
+        secret: &str,
+        event_types: &[String],
+        transport: transport::Kind,
+    ) -> Result<Endpoint> {
         let ep = sqlx::query_as::<_, Endpoint>(
-            "INSERT INTO endpoints (url, secret, event_types)
-             VALUES ($1, $2, $3)
-             RETURNING id, url, secret, event_types, enabled",
+            "INSERT INTO endpoints (url, secret, event_types, transport)
+             VALUES ($1, $2, $3, $4)
+             RETURNING id, url, secret, event_types, enabled, transport",
         )
         .bind(url)
         .bind(secret)
         .bind(event_types)
+        .bind(transport.as_str())
         .fetch_one(&self.pool)
         .await?;
         Ok(ep)
@@ -370,7 +386,7 @@ impl Store {
 
     pub async fn get_endpoint(&self, id: Uuid) -> Result<Endpoint> {
         sqlx::query_as::<_, Endpoint>(
-            "SELECT id, url, secret, event_types, enabled FROM endpoints WHERE id = $1",
+            "SELECT id, url, secret, event_types, enabled, transport FROM endpoints WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -589,7 +605,8 @@ impl Store {
                     ep.rate_per_second AS rate_per_second,
                     ep.burst        AS burst,
                     ep.breaker_state AS breaker_state,
-                    ep.breaker_probe_at AS breaker_probe_at
+                    ep.breaker_probe_at AS breaker_probe_at,
+                    ep.transport    AS transport
              FROM deliveries d
              JOIN events    e  ON e.id  = d.event_id
              JOIN endpoints ep ON ep.id = d.endpoint_id
@@ -620,7 +637,8 @@ impl Store {
                     ep.rate_per_second AS rate_per_second,
                     ep.burst        AS burst,
                     ep.breaker_state AS breaker_state,
-                    ep.breaker_probe_at AS breaker_probe_at
+                    ep.breaker_probe_at AS breaker_probe_at,
+                    ep.transport    AS transport
              FROM deliveries d
              JOIN events    e  ON e.id  = d.event_id
              JOIN endpoints ep ON ep.id = d.endpoint_id
