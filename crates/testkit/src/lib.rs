@@ -24,7 +24,7 @@ use std::{
 use axum::{
     Router,
     body::{Body, Bytes},
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -49,6 +49,13 @@ struct Inner {
     received: Mutex<Vec<String>>,
     /// Bodies seen, for assertions about byte fidelity.
     bodies: Mutex<Vec<Vec<u8>>>,
+    /// The path of each request, in order.
+    ///
+    /// Needed by the chat stand-ins, where the credential is a *path segment*: the
+    /// only way to prove Relay sent the right bot token is to look at where it sent
+    /// it, and the only way to prove it did not log the token is to have the real one
+    /// somewhere to compare against.
+    paths: Mutex<Vec<String>>,
     /// The `Relay-Signature` header of each request, in order.
     ///
     /// Kept because during a secret rotation the *shape* of this header is the
@@ -101,6 +108,7 @@ impl Receiver {
                 received: Mutex::new(Vec::new()),
                 bodies: Mutex::new(Vec::new()),
                 signatures: Mutex::new(Vec::new()),
+                paths: Mutex::new(Vec::new()),
                 hits: AtomicU64::new(0),
                 in_flight: AtomicU64::new(0),
                 max_in_flight: AtomicU64::new(0),
@@ -120,6 +128,11 @@ impl Receiver {
 
     pub fn bodies(&self) -> Vec<Vec<u8>> {
         self.inner.bodies.lock().unwrap().clone()
+    }
+
+    /// Every request path seen, in order.
+    pub fn paths(&self) -> Vec<String> {
+        self.inner.paths.lock().unwrap().clone()
     }
 
     /// Every `Relay-Signature` header seen, in order.
@@ -150,6 +163,11 @@ impl Receiver {
             .route("/429", post(too_many))
             .route("/bigbody", post(big_body))
             .route("/trickle", post(trickle))
+            // Stand-ins for the chat APIs. Same shapes, same path layout — including
+            // the credential sitting in a path segment, which is the whole reason the
+            // chat transports store it apart from the address.
+            .route("/bot{token}/sendMessage", post(telegram))
+            .route("/webhooks/{id}/{token}", post(discord))
             .route("/toggle", post(toggle))
             .route("/received", get(received))
             .with_state(self.clone())
@@ -289,6 +307,67 @@ pub struct TrickleParams {
 }
 fn default_trickle_ms() -> u64 {
     50
+}
+
+/// Telegram's `sendMessage`, near enough to be worth testing against.
+///
+/// It checks the two things a real one would reject: a body with no `text`, and a
+/// `text` past the 4096-character limit. A stand-in that accepts anything proves the
+/// request was sent, not that it was right.
+async fn telegram(
+    State(state): State<Receiver>,
+    Path(token): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let _in_flight = record(&state, &headers, &body);
+    state
+        .inner
+        .paths
+        .lock()
+        .unwrap()
+        .push(format!("/bot{token}/sendMessage"));
+
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return (StatusCode::BAD_REQUEST, "not json").into_response();
+    };
+    let Some(text) = v.get("text").and_then(|t| t.as_str()) else {
+        return (StatusCode::BAD_REQUEST, "missing text").into_response();
+    };
+    if v.get("chat_id").is_none() {
+        return (StatusCode::BAD_REQUEST, "missing chat_id").into_response();
+    }
+    if text.chars().count() > 4096 {
+        return (StatusCode::BAD_REQUEST, "message is too long").into_response();
+    }
+    (StatusCode::OK, r#"{"ok":true}"#).into_response()
+}
+
+/// A Discord webhook, which answers `204` with no body on success.
+async fn discord(
+    State(state): State<Receiver>,
+    Path((id, token)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let _in_flight = record(&state, &headers, &body);
+    state
+        .inner
+        .paths
+        .lock()
+        .unwrap()
+        .push(format!("/webhooks/{id}/{token}"));
+
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return (StatusCode::BAD_REQUEST, "not json").into_response();
+    };
+    let Some(content) = v.get("content").and_then(|c| c.as_str()) else {
+        return (StatusCode::BAD_REQUEST, "missing content").into_response();
+    };
+    if content.chars().count() > 2000 {
+        return (StatusCode::BAD_REQUEST, "content is too long").into_response();
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 #[derive(Deserialize)]
