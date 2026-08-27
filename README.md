@@ -45,13 +45,13 @@ internet, it fails constantly.
 crates/
   domain/      pure logic, no I/O — signing, backoff, breaker state machine
   store/       sqlx repositories and migrations
-  dispatcher/  worker pool, reaper, HTTP sender
+  dispatcher/  worker pool, sender, reaper, pruner, heartbeat, outbox publisher
   api/         axum ingest and admin endpoints
   metrics/     every metric name, and the /metrics endpoint that renders them
   testkit/     configurable receiver for integration tests
   loadtest/    load generator and configuration sweep
   broker/      Redis Streams transport behind a trait, for running a fleet
-docs/          deployment, configuration, and how to write a receiver
+docs/          deployment, configuration, receiver integration, load test results
 ops/           Prometheus and Grafana provisioning
 Dockerfile     one builder, three runtime images
 ```
