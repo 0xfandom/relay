@@ -54,6 +54,9 @@ pub struct Endpoint {
     pub secret: Secret,
     pub event_types: Vec<String>,
     pub enabled: bool,
+    /// `http`, `telegram` or `discord`. Decides how the request is built and nothing
+    /// else — every retry, backoff, breaker and rate-limit rule is shared.
+    pub transport: String,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize)]
@@ -169,6 +172,9 @@ pub struct PendingDelivery {
     /// forever.
     pub breaker_state: String,
     pub breaker_probe_at: Option<DateTime<Utc>>,
+    /// How to turn `url` and `secret` into a request. Carried on the claim like
+    /// everything else the send path needs, so building one costs no extra query.
+    pub transport: String,
 }
 
 /// An endpoint's circuit breaker, as stored.
@@ -211,6 +217,7 @@ impl std::fmt::Debug for PendingDelivery {
             .field("burst", &self.burst)
             .field("breaker_state", &self.breaker_state)
             .field("breaker_probe_at", &self.breaker_probe_at)
+            .field("transport", &self.transport)
             .finish()
     }
 }
@@ -225,6 +232,7 @@ impl std::fmt::Debug for Endpoint {
             .field("secret", &self.secret)
             .field("event_types", &self.event_types)
             .field("enabled", &self.enabled)
+            .field("transport", &self.transport)
             .finish()
     }
 }
